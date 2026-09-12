@@ -83,8 +83,8 @@ public interface IWorldSnapshot
     /// hop through server-data (quest flags, passive tree).</summary>
     nint AreaInstance { get; }
 
-    /// <summary>Cached handle to the current InGameState. Used to reach the UI root and hover
-    /// tracker via Task 1's <see cref="Poe2Live.HoveredEntityViaTracker"/>.</summary>
+    /// <summary>Cached handle to the current InGameState. Used to reach the current
+    /// MouseOver entity through <see cref="Poe2Live.MouseOverEntity"/>.</summary>
     nint InGameState { get; }
 
     /// <summary>Cached handle to the local player entity.</summary>

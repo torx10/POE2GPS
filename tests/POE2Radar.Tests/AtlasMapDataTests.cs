@@ -8,6 +8,16 @@ public class AtlasMapDataTests
         Assert.True(AtlasMapData.Shared.ContentCount > 0, "atlas_content.json should load content");
     }
 
+    [Fact] public void Numeric_content_id_resolves_snapshot_metadata()
+    {
+        Assert.True(AtlasMapData.Shared.TryGetContent(100, out var content));
+        Assert.Equal((byte)100, content.Id);
+        Assert.Equal("Powerful Map Boss", content.Name);
+    }
+
+    [Fact] public void Unknown_numeric_content_id_degrades_gracefully()
+        => Assert.False(AtlasMapData.Shared.TryGetContent(0, out _));
+
     [Fact] public void Unknown_mapid_degrades_gracefully()
     {
         Assert.False(AtlasMapData.Shared.TryGet("DefinitelyNotAMapId", out _));

@@ -73,28 +73,5 @@ public class Poe2CampaignProbeOffsetsTests
         Assert.Equal(8,     Poe2.StateMachineExt.EntryStride);
     }
 
-    [Fact]
-    public void HoverTracker_hovered_entity_direct_matches_shipped_offset()
-    {
-        Assert.Equal(0x18,  Poe2.HoverTracker.HoveredEntityDirect);
-        Assert.Equal(0x7D8, Poe2.HoverTracker.FromUiRoot); // regression guard on shipped anchor
-    }
 
-    [Fact]
-    public void Poe2Live_exposes_campaign_probe_accessors()
-    {
-        // Reflection-only surface check — production accessors must exist so PROBE-CORE can compile
-        // without live memory. Argument-count guards against accidental signature drift.
-        var t = typeof(Poe2Live);
-        Assert.NotNull(t.GetMethod(nameof(Poe2Live.PlayerExperience)));
-        Assert.NotNull(t.GetMethod(nameof(Poe2Live.AllocatedPassiveNodeIds)));
-        Assert.NotNull(t.GetMethod(nameof(Poe2Live.TryReadTargetable)));
-        Assert.NotNull(t.GetMethod(nameof(Poe2Live.TryReadChestState)));
-        Assert.NotNull(t.GetMethod(nameof(Poe2Live.TryReadShrineUsed)));
-        Assert.NotNull(t.GetMethod(nameof(Poe2Live.TryReadTransitionableState)));
-        Assert.NotNull(t.GetMethod(nameof(Poe2Live.TryReadTriggerableBlockage)));
-        Assert.NotNull(t.GetMethod(nameof(Poe2Live.TryReadQuestFlag)));
-        Assert.NotNull(t.GetMethod(nameof(Poe2Live.HoveredEntityViaTracker)));
-        Assert.NotNull(t.GetMethod(nameof(Poe2Live.WalkUiTree)));
-    }
 }

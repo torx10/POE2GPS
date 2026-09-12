@@ -3,6 +3,7 @@
 #         ./publish.ps1 v0.1.0
 param([string]$Version = "dev")
 
+$isLocalBuild = $Version -eq "dev"
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 
@@ -13,6 +14,7 @@ dotnet publish "$root/src/POE2Radar.Overlay/POE2Radar.Overlay.csproj" `
     -p:EnableCompressionInSingleFile=false `
     -p:DebugType=none -p:DebugSymbols=false `
     -p:Deterministic=true -p:ContinuousIntegrationBuild=true `
+    -p:POE2GPSLocalBuild=$isLocalBuild `
     -o "$root/publish"
 
 # Belt-and-suspenders: never ship .pdb (they embed the build path / dev username).

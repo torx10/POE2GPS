@@ -11,14 +11,13 @@ namespace POE2Radar.Overlay;
 /// </summary>
 internal static class Bootstrap
 {
-    /// <summary>Scan + validate. Returns the best slot whose chain reaches at least
-    /// <see cref="ResolveStage.InZone"/> (preferring <see cref="ResolveStage.Full"/>), else 0. Sets
-    /// <paramref name="candidateCount"/> to the raw number of AOB hits (0 = the pattern matched nothing).</summary>
-    public static nint ScanForSlot(ProcessHandle process, MemoryReader reader, out int candidateCount)
+    /// <summary>Scan and validate candidates. Returns the best usable slot, the raw AOB hit count,
+    /// and the deepest chain stage reached by any candidate.</summary>
+    public static nint ScanForSlot(ProcessHandle process, MemoryReader reader, out int candidateCount, out ResolveStage bestStage)
     {
         candidateCount = 0;
         nint bestSlot = 0;
-        var bestStage = ResolveStage.None;
+        bestStage = ResolveStage.None;
         var probe = new Poe2Live(reader, 0);
 
         foreach (var pattern in AobPatterns.GameStateRefs)

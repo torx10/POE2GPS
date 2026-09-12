@@ -8,8 +8,10 @@ using POE2Radar.Research;
 //   --hp <N> [--mana <N>]   value-scan for the Life component, then back-walk to IngameData
 //                           and dump the resolved chain so offsets can be checked by hand.
 //   --dump <hexAddr> [len]  hex-dump a memory region (default 256 bytes) for manual inspection.
-//   --aob                   scan for IngameState via the committed AOB patterns (if any).
+//   --aob                   scan for InGameState via the committed AOB patterns (if any).
 //
+// Atlas validation includes --atlas-databiome, which checks the confirmed DataBiome +0x2BE mirror
+// against direct Biome +0x31E and reports mismatches without changing normal GPS behavior.
 // As PoE2 offsets get discovered, build this out into a per-patch sweep (see CLAUDE.md).
 
 Console.WriteLine("POE2Radar.Research");
@@ -244,34 +246,33 @@ if (HasFlag(args, "--atlas-corr"))
 
 if (HasFlag(args, "--atlas-nodefilter"))
 {
-    var (_, igsf, _, _) = ResolveChain(process, reader);
-    var uiRootf = SafePtr(reader, igsf + 0x2F0);
-    var rootf = SafePtr(reader, uiRootf + 0xB8) is var trf && trf != 0 ? trf : uiRootf;
-    // BFS, group by vtable, pick 0CECA0-like (biome) class, find the canvas = parent with most such children.
-    var q = new Queue<nint>(); q.Enqueue(rootf); var seen = new HashSet<nint>(); var byVt = new Dictionary<nint, List<nint>>();
-    while (q.Count > 0 && seen.Count < 200000) { var e = q.Dequeue(); if (e == 0 || !seen.Add(e) || SafePtr(reader, e + 8) != e) continue;
-        var vt = SafePtr(reader, e); if (vt != 0) (byVt.TryGetValue(vt, out var l) ? l : byVt[vt] = new()).Add(e);
-        var f0 = SafePtr(reader, e + 0x10); if (f0 != 0 && reader.TryReadStruct<nint>(e + 0x18, out var l0)) { var n = ((long)l0 - (long)f0) / 8; if (n is > 0 and <= 16384) for (long k = 0; k < n; k++) q.Enqueue(SafePtr(reader, f0 + (nint)(k * 8))); } }
-    nint nv = 0; var bb = 0; foreach (var (vt, l) in byVt) { if (l.Count < 50) continue; var bs = new HashSet<int>(); foreach (var e in l.Take(400)) if (reader.TryReadStruct<byte>(e + 0x32E, out var b) && b is >= 1 and <= 12) bs.Add(b); if (bs.Count > bb && l.Count > 200) { bb = bs.Count; nv = vt; } }
-    // canvas = the parent holding the most nv-class children.
-    var parentCount = new Dictionary<nint, int>();
-    foreach (var e in byVt[nv]) { var p = SafePtr(reader, e + 0xB8); if (p != 0) parentCount[p] = parentCount.GetValueOrDefault(p) + 1; }
-    var canvas = parentCount.OrderByDescending(k => k.Value).First();
-    Console.WriteLine($"node class 0x{nv:X}; canvas 0x{canvas.Key:X} holds {canvas.Value} of them.");
-    // Bucket canvas's nv children by hasChildren; report counts + samples.
-    int withChild = 0, without = 0; var exWith = new List<string>(); var exWithout = new List<string>();
-    var cf = SafePtr(reader, canvas.Key + 0x10); reader.TryReadStruct<nint>(canvas.Key + 0x18, out var cl);
-    var cn = cf == 0 ? 0 : ((long)cl - (long)cf) / 8;
-    for (long i = 0; i < cn; i++) { var ch = SafePtr(reader, cf + (nint)(i * 8)); if (ch == 0 || SafePtr(reader, ch) != nv) continue;
-        var chf = SafePtr(reader, ch + 0x10); long ccc = 0; if (chf != 0 && reader.TryReadStruct<nint>(ch + 0x18, out var chl)) ccc = ((long)chl - (long)chf) / 8;
-        reader.TryReadStruct<uint>(ch + 0x300, out var id); reader.TryReadStruct<byte>(ch + 0x32E, out var bm); reader.TryReadStruct<float>(ch + 0x118, out var px); reader.TryReadStruct<float>(ch + 0x11C, out var py);
-        // peek a content-icon descendant's content (child→child→0D0680.content).
-        uint deepContent = 0; var d = chf;
-        for (var lvl = 0; lvl < 3 && d != 0; lvl++) { reader.TryReadStruct<uint>(d + 0x310, out deepContent); if (deepContent is > 0 and < 256) break; d = SafePtr(reader, d + 0x10) is var dd && dd != 0 ? SafePtr(reader, dd) : 0; }
-        var line = $"id={id} biome={bm} children={ccc} deepContent={deepContent} pos=({px:F0},{py:F0})";
-        if (ccc > 0) { withChild++; if (exWith.Count < 6) exWith.Add(line); } else { without++; if (exWithout.Count < 6) exWithout.Add(line); }
+    var (_, igs, _, _) = ResolveChain(process, reader);
+    var (nodeVt, canvas, nodes) = FindAtlasNodeClass(reader, igs);
+    if (nodeVt == 0 || canvas == 0) { Console.Error.WriteLine("no atlas-node class found (open the Atlas map)."); return 1; }
+    Console.WriteLine($"node class 0x{nodeVt:X}; canvas 0x{canvas:X} holds {nodes.Count} instances.");
+
+    int withChild = 0, without = 0;
+    var exWith = new List<string>(); var exWithout = new List<string>();
+    var first = SafePtr(reader, canvas + Poe2.UiElement.Children);
+    reader.TryReadStruct<nint>(canvas + Poe2.UiElement.ChildrenEnd, out var last);
+    var count = first == 0 ? 0 : ((long)last - (long)first) / 8;
+    for (long i = 0; i < count; i++)
+    {
+        var el = SafePtr(reader, first + (nint)(i * 8));
+        if (el == 0 || SafePtr(reader, el) != nodeVt) continue;
+        var childFirst = SafePtr(reader, el + Poe2.UiElement.Children);
+        long childCount = 0;
+        if (childFirst != 0 && reader.TryReadStruct<nint>(el + Poe2.UiElement.ChildrenEnd, out var childLast))
+            childCount = ((long)childLast - (long)childFirst) / 8;
+        reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos, out var gx);
+        reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos + 4, out var gy);
+        reader.TryReadStruct<float>(el + Poe2.UiElement.RelativePos, out var x);
+        reader.TryReadStruct<float>(el + Poe2.UiElement.RelativePos + 4, out var y);
+        var line = $"grid=({gx},{gy}) children={childCount} pos=({x:F0},{y:F0})";
+        if (childCount > 0) { withChild++; if (exWith.Count < 6) exWith.Add(line); }
+        else { without++; if (exWithout.Count < 6) exWithout.Add(line); }
     }
-    Console.WriteLine($"canvas {nv:X} children: {withChild} WITH children (nodes?), {without} WITHOUT (terrain?)");
+    Console.WriteLine($"canvas node children: {withChild} WITH children, {without} WITHOUT");
     Console.WriteLine("-- WITH children --"); exWith.ForEach(s => Console.WriteLine("   " + s));
     Console.WriteLine("-- WITHOUT children --"); exWithout.ForEach(s => Console.WriteLine("   " + s));
     return 0;
@@ -279,20 +280,24 @@ if (HasFlag(args, "--atlas-nodefilter"))
 
 if (TryGetHexArg(args, "--atlas-up") is { } upEl)
 {
-    Console.WriteLine($"ancestor chain from 0x{upEl:X} (via Parent +0xB8):");
+    Console.WriteLine($"ancestor chain from 0x{upEl:X} (via Parent +0x{Poe2.UiElement.Parent:X}):");
     var cur = upEl; var guard = 0;
     while (cur != 0 && guard++ < 20)
     {
         var vt = SafePtr(reader, cur);
-        reader.TryReadStruct<uint>(cur + 0x300, out var id);
-        reader.TryReadStruct<uint>(cur + 0x310, out var content);
-        reader.TryReadStruct<byte>(cur + 0x32E, out var biome);
-        reader.TryReadStruct<float>(cur + 0x118, out var px); reader.TryReadStruct<float>(cur + 0x11C, out var py);
-        reader.TryReadStruct<float>(cur + 0x288, out var sw); reader.TryReadStruct<float>(cur + 0x28C, out var sh);
-        var first = SafePtr(reader, cur + 0x10); long cc = 0;
-        if (first != 0 && reader.TryReadStruct<nint>(cur + 0x18, out var last)) cc = ((long)last - (long)first) / 8;
-        Console.WriteLine($"  0x{cur:X} vt=0x{vt:X} children={cc} id={id} content={content} biome={biome} pos=({px:F0},{py:F0}) size=({sw:F0}x{sh:F0})");
-        var par = SafePtr(reader, cur + 0xB8); if (par == cur) break; cur = par;
+        reader.TryReadStruct<int>(cur + Poe2.AtlasNode.GridPos, out var gx);
+        reader.TryReadStruct<int>(cur + Poe2.AtlasNode.GridPos + 4, out var gy);
+        reader.TryReadStruct<float>(cur + Poe2.UiElement.RelativePos, out var x);
+        reader.TryReadStruct<float>(cur + Poe2.UiElement.RelativePos + 4, out var y);
+        reader.TryReadStruct<float>(cur + Poe2.UiElement.SizeW, out var w);
+        reader.TryReadStruct<float>(cur + Poe2.UiElement.SizeH, out var h);
+        var first = SafePtr(reader, cur + Poe2.UiElement.Children); long count = 0;
+        if (first != 0 && reader.TryReadStruct<nint>(cur + Poe2.UiElement.ChildrenEnd, out var last))
+            count = ((long)last - (long)first) / 8;
+        Console.WriteLine($"  0x{cur:X} vt=0x{vt:X} children={count} grid=({gx},{gy}) pos=({x:F0},{y:F0}) size=({w:F0}x{h:F0})");
+        var parent = SafePtr(reader, cur + Poe2.UiElement.Parent);
+        if (parent == cur) break;
+        cur = parent;
     }
     return 0;
 }
@@ -308,6 +313,9 @@ if (HasFlag(args, "--atlas-diag"))
 
 if (HasFlag(args, "--atlas-probe"))
     return RunAtlasProbe(process, reader);
+
+if (HasFlag(args, "--atlas-databiome"))
+    return RunAtlasDataBiome(process, reader);
 
 if (HasFlag(args, "--atlas-content"))
     return RunAtlasContent(process, reader);
@@ -342,10 +350,9 @@ if (HasFlag(args, "--atlas-readnodes"))
     var n2 = atlas.ReadNodes(igs2, true, true);      // cached fast path
     Console.WriteLine($"ReadNodes: {nodes.Count} nodes (first {t1}ms, cached {sw.ElapsedMilliseconds - t1}ms). " +
         $"visible={n2.Count(n => n.Visible)} hasContent={n2.Count(n => n.HasContent)} unvisited={n2.Count(n => !n.Visited)} unlocked={n2.Count(n => n.Unlocked)}");
-    Console.WriteLine("biome histogram: " + string.Join(" ", n2.GroupBy(n => n.Biome).OrderBy(g => g.Key).Select(g => $"{g.Key}:{g.Count()}")));
     Console.WriteLine("sample (visible, hasContent or unvisited):");
     foreach (var n in n2.Where(n => n.Visible && (n.HasContent || !n.Visited)).Take(16))
-        Console.WriteLine($"  id={n.Id,-9} biome={n.Biome,-2} content={n.Content,-6} flags=0x{n.Flags:X2}(unlk={(n.Unlocked ? 1 : 0)} vis={(n.Visited ? 1 : 0)}) compl={n.Completion} pos=({n.X:F0},{n.Y:F0}) size=({n.W:F0}x{n.H:F0}) scale={n.Scale:G4}");
+        Console.WriteLine($"  id={n.Id,-9} map={n.MapCode,-24} grid={n.Grid} state=0x{n.State:X2} row={n.MapRowIndex} biome={n.Biome} flags=0x{n.Flags:X2}(unlk={(n.Unlocked ? 1 : 0)} vis={(n.Visited ? 1 : 0)}) compl={n.Completion} contentIds=[{string.Join(',', n.ContentIds)}] names=[{string.Join(", ", n.ContentNames)}] pos=({n.X:F0},{n.Y:F0}) size=({n.W:F0}x{n.H:F0}) scale={n.Scale:G4}");
     return 0;
 }
 
@@ -385,21 +392,13 @@ Console.WriteLine("  --rune-dump [--radius N]   dump nearby entities (path/compo
 Console.WriteLine("  --buffs [--entity <hex>] [--watch] [--interval <ms>]  discover/decode the Buffs component (buff list vector, ids, timers)");
 Console.WriteLine("  --presence [--diff]        baseline (then --diff) player components to find the presence-radius float");
 Console.WriteLine("  --devtree [--port N]       browser-based live memory/UI/entity explorer (default port 7778)");
-Console.WriteLine("  --serverdata               dump ServerData (AreaInstance+0x598): strings + StdVector quest-list candidates");
+Console.WriteLine("  --serverdata               dump ServerData via AreaInstance.ServerDataPtr");
 Console.WriteLine("  --aob                      scan for IngameState via AOB patterns");
 return 0;
 
 // ── ServerData probe — locate the quest-state container ────────────────────
-// AreaInstance+0x598 is the PlayerInfo/LocalPlayerStruct base on 0.5.4 (was 0x580, +0x18) (+0x00
-// ServerDataPtr, +0x20 LocalPlayerPtr). LocalPlayer @ AreaInstance+0x5B8 (= base+0x20) is validated,
-// so the +0x598 deref is the ServerData object. In PoE1 upstream reference, ServerData holds the quest-states
-// list (among league/guild/passives). This surfaces ServerData's strings (to confirm identity)
-// and its StdVector-shaped fields (quest-list candidates), and writes the raw region to a temp
-// file so two runs (before/after advancing a quest) can be byte-diffed to pinpoint quest flags.
-//
-// FINDINGS (2026-05-31, PAUSED mid-decode — resume here):
-//   • ServerData = *(AreaInstance+0x598) CONFIRMED — its +0x20 equals the validated LocalPlayer
-//     (AreaInstance+0x5B8), so the PlayerInfo shape holds.
+// Resolves ServerData and LocalPlayer through the authoritative AreaInstance fields, then surfaces
+// strings and StdVector-shaped fields for quest-state discovery.
 //   • Clean before/after-quest diffs (delta 0, no zone change) RULED OUT two volatile candidates:
 //     +0x22D0 (an int that drifts up AND down between reads) and the +0x23C8 StdVector (reallocates
 //     constantly; grew 27→204 across a zone — content/area-dependent, NOT a stable quest list).
@@ -550,8 +549,8 @@ static int RunServerDataDiff(ProcessHandle process, MemoryReader reader)
 // ── Player inventory + item-structure probe ────────────────────────────────
 // Walks the upstream reference inventory chain (re-derived for our drifted build) and dumps every
 // inventory + every item's identity (metadata, rarity, identified, art, stack) and mod ids.
-//   AreaInstance +0x580 -> ServerData
-//   ServerData   +0x48  -> StdVector PlayerServerData ; [0] -> ServerDataStructure
+//   AreaInstance.ServerDataPtr -> ServerData
+//   ServerData +0x48 -> StdVector PlayerServerData ; [0] -> ServerDataStructure
 //   ServerDataStructure +0x320 -> StdVector PlayerInventories (InventoryArrayStruct, stride 0x18)
 //     InventoryArrayStruct: +0x00 int Id, +0x08 ptr Inventory, +0x10 ptr(=+0x08 - 0x10)
 //   InventoryStruct: +0x150 TotalBoxes(int x,int y), +0x170 StdVector ItemList(ptr InventoryItem), +0x1E8 int ReqCounter
@@ -564,7 +563,7 @@ static int RunInventory(ProcessHandle process, MemoryReader reader, int onlyInv,
 
     var serverData = SafePtr(reader, ai + Poe2.AreaInstance.ServerDataPtr);
     var localPlayer = SafePtr(reader, ai + Poe2.AreaInstance.LocalPlayer);
-    Console.WriteLine($"AreaInstance 0x{ai:X}  ServerData(+0x598) 0x{serverData:X}  LocalPlayer(+0x5B8) 0x{localPlayer:X}");
+    Console.WriteLine($"AreaInstance 0x{ai:X}  ServerData(+0x{Poe2.AreaInstance.ServerDataPtr:X}) 0x{serverData:X}  LocalPlayer(+0x{Poe2.AreaInstance.LocalPlayer:X}) 0x{localPlayer:X}");
     if (serverData == 0) { Console.Error.WriteLine("ServerData null."); return 1; }
 
     // Step 1 — PlayerServerData vector @ ServerData+0x48; element [0] = the player's ServerDataStructure.
@@ -1041,8 +1040,8 @@ static int RunEntityProbe(MemoryReader reader, nint entity)
     const float WorldToGridRatio = 250f / 23f; // ≈ 10.8696 (upstream reference TileStructure)
 
     Console.WriteLine($"Entity @ 0x{entity:X16}");
-    if (!reader.TryReadStruct<uint>(entity + 0x80, out var id) ||
-        !reader.TryReadStruct<byte>(entity + 0x84, out var isValid))
+    if (!reader.TryReadStruct<uint>(entity + Poe2.Entity.Id, out var id) ||
+        !reader.TryReadStruct<byte>(entity + Poe2.Entity.IsValid, out var isValid))
     {
         Console.Error.WriteLine("  could not read Entity.Id / IsValid");
         return 1;
@@ -1289,8 +1288,8 @@ static int RunCamera(ProcessHandle process, MemoryReader reader)
     Win.GetClientRect(Win.GetForegroundWindow(), out var rc);
     int W = rc.right - rc.left, H = rc.bottom - rc.top;
     if (W <= 0) { W = 1920; H = 1080; }
-    var cam368 = SafePtr(reader, igs + 0x368);
-    Console.WriteLine($"InGameState 0x{igs:X}  Camera(*+0x368) 0x{cam368:X}  player world=({w.X:F1},{w.Y:F1},{w.Z:F1})  window={W}x{H}");
+    var cam368 = SafePtr(reader, igs + Poe2.InGameState.Camera);
+    Console.WriteLine($"InGameState 0x{igs:X}  Camera(*+0x{Poe2.InGameState.Camera:X}) 0x{cam368:X}  player world=({w.X:F1},{w.Y:F1},{w.Z:F1})  window={W}x{H}");
     var monsters = new List<POE2Radar.Core.Game.Vector3>();
     var head = SafePtr(reader, ai + Poe2.AreaInstance.AwakeEntities);
     if (head != 0)
@@ -1323,9 +1322,9 @@ static int RunCamera(ProcessHandle process, MemoryReader reader)
     // Zoom per the community note (Camera+0x528) — a sanity readout.
     if (cam368 != 0 && reader.TryReadStruct<float>(cam368 + 0x528, out var zoom)) Console.WriteLine($"  Camera.Zoom(*+0x528) = {zoom}");
 
-    // Scan candidate camera objects: the +0x368 camera first, then any pointer in InGameState.
+    // Scan candidate camera objects: the configured camera first, then any pointer in InGameState.
     var objs = new List<(string label, nint addr)>();
-    if (cam368 != 0) objs.Add(("Camera+0x368", cam368));
+    if (cam368 != 0) objs.Add(($"Camera+0x{Poe2.InGameState.Camera:X}", cam368));
     for (var o = 0; o < 0x600; o += 8) { var p = SafePtr(reader, igs + o); if (p != 0 && p != cam368) objs.Add(($"IGS+0x{o:X3}", p)); }
 
     var buf = new byte[0x600];
@@ -1353,7 +1352,7 @@ static int RunCamera(ProcessHandle process, MemoryReader reader)
             Console.WriteLine($"  {label} (0x{cam:X}) matrix@+0x{mo:X3} -> player=({sx:F0},{sy:F0}) w={cw:F1}  onScreen={on}/{monsters.Count} spreadX={spread}");
         }
     }
-    Console.WriteLine("Real W2S: from the Camera+0x368 object, player≈center, all monsters on-screen, and a healthy spreadX.");
+    Console.WriteLine($"Real W2S: from the Camera+0x{Poe2.InGameState.Camera:X} object, player≈center, all monsters on-screen, and a healthy spreadX.");
     return 0;
 }
 
@@ -1361,18 +1360,18 @@ static int RunCamera(ProcessHandle process, MemoryReader reader)
 // name/level, camera/zoom — and dump the camera object so the WorldToScreen matrix can be found.
 static int RunInfo(ProcessHandle process, MemoryReader reader)
 {
-    // NOTE: ResolveChain returns (gameState, inGameState, areaInstance, localPlayer). Take the
-    // 2nd element as InGameState (was mistakenly taking the 1st = GameState, making the Camera
-    // read below resolve GameState+0x368 = garbage).
+    // ResolveChain returns (gameState, inGameState, areaInstance, localPlayer); use the second element
+    // before reading Camera.
     var (_, igs, ai, lp) = ResolveChain(process, reader);
     if (ai == 0) { Console.Error.WriteLine("Could not resolve chain (in game?)."); return 1; }
     Console.WriteLine($"InGameState 0x{igs:X}  AreaInstance 0x{ai:X}  LocalPlayer 0x{lp:X}");
 
-    // Area name: AreaInstance+0xA0 -> AreaInfo -> +0x00 -> UTF-16 "Code\0Name\0".
-    var areaInfo = SafePtr(reader, ai + 0xA0);
-    var strPtr = SafePtr(reader, areaInfo);
-    var code = reader.ReadStringUtf16(strPtr, 64);
-    var name = code.Length > 0 ? reader.ReadStringUtf16(strPtr + (nint)((code.Length + 1) * 2), 64) : "";
+    // Area identity comes from two pointers in the current AreaInfo row.
+    var areaInfo = SafePtr(reader, ai + Poe2.AreaInstance.AreaInfoPtr);
+    var codePtr = SafePtr(reader, areaInfo + Poe2.AreaInfo.Code);
+    var namePtr = SafePtr(reader, areaInfo + Poe2.AreaInfo.Name);
+    var code = reader.ReadStringUtf16(codePtr, 64);
+    var name = reader.ReadStringUtf16(namePtr, 64);
     Console.WriteLine($"AreaInfo 0x{areaInfo:X}  Code='{code}'  Name='{name}'");
 
     // Character: try the Player component, then a 'Character' component if present.
@@ -1387,8 +1386,8 @@ static int RunInfo(ProcessHandle process, MemoryReader reader)
         Console.WriteLine($"  [{compName}] @0x{c:X}  name@0x1B0(raw)='{nm0x1B0}' (std)='{nmStd}'  lvl@0x204 int={lvl204} byte={lvlByte}");
     }
 
-    // Camera: InGameState+0x368 -> Camera; Zoom @ +0x528. Dump +0x000..+0x160 to spot the 4x4 matrix.
-    var cam = SafePtr(reader, igs + 0x368);
+    // Camera: configured InGameState pointer; Zoom @ +0x528. Dump +0x000..+0x160 to spot the 4x4 matrix.
+    var cam = SafePtr(reader, igs + Poe2.InGameState.Camera);
     Console.WriteLine($"Camera 0x{cam:X}");
     if (cam != 0)
     {
@@ -1640,8 +1639,8 @@ static int RunXp(ProcessHandle process, MemoryReader reader)
 // likely a sibling field next to PlayerInventories (+0x320) inside this same structure.
 //
 // Resolution chain (mirrors --inventory):
-//   AreaInstance+0x580 → ServerData
-//   ServerData+0x48    → StdVector<ptr> PlayerServerData ; [0] → ServerDataStructure base
+//   AreaInstance.ServerDataPtr → ServerData
+//   ServerData+0x48 → StdVector<ptr> PlayerServerData ; [0] → ServerDataStructure base
 //
 // Output key:
 //   PTR  — qword looks like a userspace heap pointer (canonical 64-bit, 8-aligned, > 0x10000)
@@ -1682,7 +1681,7 @@ static int RunQuest(ProcessHandle process, MemoryReader reader, bool diff)
     if (ai == 0) { Console.Error.WriteLine("Could not resolve chain (in game?)."); return 1; }
 
     var serverData = SafePtr(reader, ai + Poe2.AreaInstance.ServerDataPtr);
-    Console.WriteLine($"AreaInstance 0x{ai:X}  ServerData(+0x598) 0x{serverData:X}");
+    Console.WriteLine($"AreaInstance 0x{ai:X}  ServerData(+0x{Poe2.AreaInstance.ServerDataPtr:X}) 0x{serverData:X}");
     if (serverData == 0) { Console.Error.WriteLine("ServerData null — wrong offset or not in game."); return 1; }
 
     var sdStruct = ResolveServerDataStruct(reader, serverData);
@@ -2950,9 +2949,8 @@ static nint ResolveComponentAddr(MemoryReader reader, nint entity, string name)
 
 // ── Tiles: read the terrain tile grid (upstream reference GetTgtFileData) — each tile's TgtPath →
 // grid positions. Shows what static tile-based landmarks exist (boss arenas, special rooms,
-// waypoints) and whether a per-tile semantic "detail name" is reachable. TerrainStruct @
-// AreaInstance+0x8B8 (0.5.4; was 0x8A0): TotalTiles@+0x18, TileDetailsPtr StdVector@+0x28
-// (TileStructure=0x38); TileStructure.TgtFilePtr@+0x8 → TgtFileStruct.TgtPath (StdWString)@+0x8.
+// waypoints) and whether a per-tile semantic "detail name" is reachable. TerrainStruct comes from
+// AreaInstance.TerrainMetadata; its remaining fields use the named Terrain/TileStructure offsets.
 static int RunTiles(ProcessHandle process, MemoryReader reader)
 {
     var (_, _, ai, _) = ResolveChain(process, reader);
@@ -3278,8 +3276,8 @@ static int RunRitual(ProcessHandle process, MemoryReader reader, bool watch)
 // ── Ritual TRIBUTE shop panel discovery ──────────────────────────────────────────────────────────
 // The post-ritual "buy with tribute" shop is a UI panel (NOT a ServerData PlayerInventory — the 5x1
 // reward inventories there read empty). So we attack it from the UiElement tree like --runeforge:
-//   1) GameUi = Ptr(InGameState + UiRoot 0x2F0); full-tree DFS over Children (+0x10/+0x18 StdVector).
-//   2) TEXT pass: every element's inline std::wstring @ +0x390 (the runeforge text offset). Report each
+//   1) GameUi = Ptr(InGameState + Poe2.InGameState.UiRoot); full-tree DFS over Children.
+//   2) TEXT pass: every element's inline std::wstring at Poe2.UiElement.Text. Report each
 //      element whose text matches an anchor needle (the known cost "1,590"/"1590" + "tribute"/"ritual"/
 //      "briar" + any --find <needle>), with its geometry and full ancestor chain (Parent +0xB8) — that
 //      chain is the raw material for a flag-fingerprint resolve walk later.
@@ -3302,7 +3300,7 @@ static int RunTribute(ProcessHandle process, MemoryReader reader, string? extraN
     var needles = new List<string> { "1,590", "1590", "tribute", "ritual", "briar", "reroll", "defer", "favour", "sacrifice" };
     if (!string.IsNullOrWhiteSpace(extraNeedle)) needles.Add(extraNeedle.Trim());
 
-    const int TextWStr = 0x390;
+    const int TextWStr = Poe2.UiElement.Text;
     const uint VisMask = 1u << Poe2.UiElement.FlagVisibleBit;
 
     // ── DFS the whole UiElement tree once, recording text-bearing + item-bearing elements. ──
@@ -3320,7 +3318,7 @@ static int RunTribute(ProcessHandle process, MemoryReader reader, string? extraN
 
         reader.TryReadStruct<uint>(el + Poe2.UiElement.Flags, out var flags);
 
-        // Text: inline wstring @ +0x390.
+        // Text: inline wstring at the current UiElement.Text offset.
         var text = ReadStdWString(reader, el + TextWStr);
         if (!string.IsNullOrEmpty(text) && text.Length <= 120 && IsMostlyPrintable(text))
         {
@@ -3689,7 +3687,7 @@ static int RunTooltipCapture(ProcessHandle process, MemoryReader reader)
         if (el == 0 || !visited.Add(el) || depth > 80) continue;
         nodes++;
         reader.TryReadStruct<uint>(el + Poe2.UiElement.Flags, out var flags);
-        var txt = ReadStdWString(reader, el + 0x390);
+        var txt = ReadStdWString(reader, el + Poe2.UiElement.Text);
 
         var body = new byte[0x600];
         if (reader.TryReadBytes(el, body) >= body.Length)
@@ -3851,8 +3849,8 @@ static int RunSubtree(ProcessHandle process, MemoryReader reader, nint root, int
     (float x, float y, float w, float h) Rect(nint el)
     {
         var (ux, uy) = RfUnscaledPos(reader, el, 0);
-        reader.TryReadStruct<float>(el + 0x288, out var w); reader.TryReadStruct<float>(el + 0x28C, out var h);
-        reader.TryReadStruct<byte>(el + 0x18A, out var sidx);
+        reader.TryReadStruct<float>(el + Poe2.UiElement.SizeW, out var w); reader.TryReadStruct<float>(el + Poe2.UiElement.SizeH, out var h);
+        reader.TryReadStruct<byte>(el + Poe2.UiElement.ScaleIndex, out var sidx);
         var (sx, sy) = sidx switch { 1 => (v1, v1), 3 => (v1, v2), _ => (v2, v2) };
         return (ux * sx, uy * sy, w * sx, h * sy);
     }
@@ -3907,7 +3905,7 @@ static int RunSubtree(ProcessHandle process, MemoryReader reader, nint root, int
         if (el == 0 || depth > down) return;
         reader.TryReadStruct<uint>(el + Poe2.UiElement.Flags, out var fl);
         var (x, y, w, h) = Rect(el);
-        var txt = ReadStdWString(reader, el + 0x390);
+        var txt = ReadStdWString(reader, el + Poe2.UiElement.Text);
         var pad = new string(' ', depth * 2);
         Console.WriteLine($"{pad}• 0x{el:X} d{depth} flags=0x{fl & ~VisMask:X} vis={(fl & VisMask) != 0} rect=({x:0},{y:0} {w:0}x{h:0}) {(string.IsNullOrEmpty(txt) ? "" : $"text=\"{txt}\"")}");
         Identity(el, pad);
@@ -3957,9 +3955,9 @@ static int RunTributeHover(ProcessHandle process, MemoryReader reader)
         if (visible)
         {
             var (ux, uy) = RfUnscaledPos(reader, el, 0);
-            reader.TryReadStruct<float>(el + 0x288, out var usw);
-            reader.TryReadStruct<float>(el + 0x28C, out var ush);
-            reader.TryReadStruct<byte>(el + 0x18A, out var sidx);
+            reader.TryReadStruct<float>(el + Poe2.UiElement.SizeW, out var usw);
+            reader.TryReadStruct<float>(el + Poe2.UiElement.SizeH, out var ush);
+            reader.TryReadStruct<byte>(el + Poe2.UiElement.ScaleIndex, out var sidx);
             var (sx, sy) = sidx switch { 1 => (v1, v1), 3 => (v1, v2), _ => (v2, v2) };
             float x = ux * sx, y = uy * sy, w = usw * sx, h = ush * sy;
             if (w > 0 && h > 0 && cur.X >= x && cur.X <= x + w && cur.Y >= y && cur.Y <= y + h)
@@ -3974,7 +3972,7 @@ static int RunTributeHover(ProcessHandle process, MemoryReader reader)
     foreach (var h in hitsUnderCursor.Take(18))
     {
         reader.TryReadStruct<uint>(h.el + Poe2.UiElement.Flags, out var fl);
-        var txt = ReadStdWString(reader, h.el + 0x390);
+        var txt = ReadStdWString(reader, h.el + Poe2.UiElement.Text);
         Console.WriteLine($"• 0x{h.el:X} d{h.depth} flags=0x{fl & ~VisMask:X} rect=({h.x:0},{h.y:0} {h.w:0}x{h.h:0})  text=\"{txt}\"");
         // Identity hunt: item Entity ptr or 2DItems icon DDS reachable from the body.
         var body = new byte[0x380];
@@ -4079,7 +4077,7 @@ static int RunTributeTiles(ProcessHandle process, MemoryReader reader, string co
 static void ReportTile(MemoryReader reader, nint el, int depth, string note)
 {
     reader.TryReadStruct<uint>(el + Poe2.UiElement.Flags, out var flags);
-    var txt = ReadStdWString(reader, el + 0x390);
+    var txt = ReadStdWString(reader, el + Poe2.UiElement.Text);
     DumpUiEl(reader, el, depth, flags, $"{note}  text=\"{txt}\"");
     DumpAncestors(reader, el);
 }
@@ -4094,10 +4092,10 @@ static bool IsMostlyPrintable(string s)
 static void DumpUiEl(MemoryReader reader, nint el, int depth, uint flags, string note)
 {
     const uint VisMask = 1u << Poe2.UiElement.FlagVisibleBit;
-    reader.TryReadStruct<float>(el + 0x118, out var rx);
-    reader.TryReadStruct<float>(el + 0x11C, out var ry);
-    reader.TryReadStruct<float>(el + 0x288, out var sw);
-    reader.TryReadStruct<float>(el + 0x28C, out var sh);
+    reader.TryReadStruct<float>(el + Poe2.UiElement.RelativePos, out var rx);
+    reader.TryReadStruct<float>(el + Poe2.UiElement.RelativePos + 4, out var ry);
+    reader.TryReadStruct<float>(el + Poe2.UiElement.SizeW, out var sw);
+    reader.TryReadStruct<float>(el + Poe2.UiElement.SizeH, out var sh);
     Console.WriteLine($"\n• 0x{el:X} d{depth} flags=0x{flags:X8} (masked 0x{flags & ~VisMask:X}) vis={(flags & VisMask) != 0} "
                     + $"relPos=({rx:0.#},{ry:0.#}) size=({sw:0.#}x{sh:0.#})  {note}");
 }
@@ -4312,11 +4310,11 @@ static System.Numerics.Vector2 EntityGrid(MemoryReader reader, nint entity)
 // ── Runeforge / "Runeshape Combinations" reward panel probe ─────────────────────────────────────
 // Validates (against the LIVE patch, with the panel OPEN) the port of upstream reference's RuneforgeHelper:
 //   1) resolve the recipes panel by a UI-FLAGS-FINGERPRINT walk with backtracking from GameUi
-//      (= Ptr(InGameState + UiRoot 0x2F0), the UiRootStruct the game treats as a UiElement). Child
-//      indices drift across restarts/patches but each element's Flags "role" bits are stable — so we
+//      (= Ptr(InGameState + Poe2.InGameState.UiRoot)). Child indices drift across restarts/patches,
+//      but each element's Flags "role" bits are stable — so we
 //      match (flags & ~visibleBit) == fingerprint, trying visible siblings first, and backtrack to
 //      whichever branch bottoms out at a real recipes-container (rows whose kid[0] has a name wstring).
-//   2) read each VISIBLE row: kid[0] inline std::wstring @ +0x390 = "<count>x <name>".
+//   2) read each VISIBLE row: kid[0] inline std::wstring at Poe2.UiElement.Text = "<count>x <name>".
 //   3) dump each row's raw geometry fields (relPos/size/scale) so the overlay-side screen projection
 //      can be ported with confidence. Run with the Runeshape Combinations panel OPEN.
 static int RunRuneforge(ProcessHandle process, MemoryReader reader)
@@ -4325,7 +4323,7 @@ static int RunRuneforge(ProcessHandle process, MemoryReader reader)
     // → … → recipes-container. Match (flags & ~visibleBit); see RfWalk.
     uint[] fps = { 0x00462EF1, 0x00502EF3, 0x00502EF7, 0x00542EF1, 0x00502EF1 };
     const uint UiVisibleMask = 1u << Poe2.UiElement.FlagVisibleBit; // 0x800
-    const int RuneforgeNameWString = 0x390;     // kid[0] inline "<count>x <name>" wstring
+    const int RuneforgeNameWString = Poe2.UiElement.Text;
     nint slot = 0;
     foreach (var pat in AobPatterns.GameStateRefs)
         foreach (var s in AobScanner.ScanForResolvedAddresses(process, reader, pat).Distinct())
@@ -4369,12 +4367,12 @@ static int RunRuneforge(ProcessHandle process, MemoryReader reader)
         RfParseNameCount(raw, out var count, out var name);
 
         // Raw geometry fields (validate the screen-projection port).
-        reader.TryReadStruct<float>(row + 0x118, out var rx);       // RelativePosition.X
-        reader.TryReadStruct<float>(row + 0x11C, out var ry);       // RelativePosition.Y
-        reader.TryReadStruct<float>(row + 0x288, out var sw);       // UnscaledSize.X
-        reader.TryReadStruct<float>(row + 0x28C, out var sh);       // UnscaledSize.Y
-        reader.TryReadStruct<float>(row + 0x130, out var smul);     // LocalScaleMultiplier
-        reader.TryReadStruct<byte>(row + 0x18A, out var sidx);      // ScaleIndex
+        reader.TryReadStruct<float>(row + Poe2.UiElement.RelativePos, out var rx);       // RelativePosition.X
+        reader.TryReadStruct<float>(row + Poe2.UiElement.RelativePos + 4, out var ry);       // RelativePosition.Y
+        reader.TryReadStruct<float>(row + Poe2.UiElement.SizeW, out var sw);       // UnscaledSize.X
+        reader.TryReadStruct<float>(row + Poe2.UiElement.SizeH, out var sh);       // UnscaledSize.Y
+        reader.TryReadStruct<float>(row + Poe2.UiElement.LocalScaleMul, out var smul);     // LocalScaleMultiplier
+        reader.TryReadStruct<byte>(row + Poe2.UiElement.ScaleIndex, out var sidx);      // ScaleIndex
         var (ux, uy) = RfUnscaledPos(reader, row, 0);
         shown++;
         Console.WriteLine($"  [{shown}] '{raw}'  -> count={count} name='{name}'");
@@ -4414,7 +4412,7 @@ static nint RfWalk(MemoryReader reader, nint parent, int step, uint[] fps)
 
 static bool RfIsRecipesContainer(MemoryReader reader, nint addr)
 {
-    const int RuneforgeNameWString = 0x390;
+    const int RuneforgeNameWString = Poe2.UiElement.Text;
     if (!RfChildren(reader, addr, out var first, out var n)) return false;
     for (long i = 0; i < n; i++)
     {
@@ -4446,8 +4444,8 @@ static nint RfChild(MemoryReader reader, nint el, int index)
 // The final ×(winSize/2560,1600) scaling is done overlay-side where the window size is known.
 static (float x, float y) RfUnscaledPos(MemoryReader reader, nint el, int depth)
 {
-    reader.TryReadStruct<float>(el + 0x118, out var lx);
-    reader.TryReadStruct<float>(el + 0x11C, out var ly);
+    reader.TryReadStruct<float>(el + Poe2.UiElement.RelativePos, out var lx);
+    reader.TryReadStruct<float>(el + Poe2.UiElement.RelativePos + 4, out var ly);
     var parent = SafePtr(reader, el + Poe2.UiElement.Parent);
     if (parent == 0 || depth >= 64) return (lx, ly);
     var (px, py) = RfUnscaledPos(reader, parent, depth + 1);
@@ -4665,8 +4663,8 @@ static int RunLootVec(ProcessHandle process, MemoryReader reader)
         var name = known.GetValueOrDefault((long)item, "?");
         reader.TryReadStruct<float>(lbl + Poe2.UiElement.SizeW, out var sw);
         reader.TryReadStruct<float>(lbl + Poe2.UiElement.SizeH, out var sh);
-        reader.TryReadStruct<byte>(lbl + 0x18A, out var sidx);
-        reader.TryReadStruct<float>(lbl + 0x130, out var smul);
+        reader.TryReadStruct<byte>(lbl + Poe2.UiElement.ScaleIndex, out var sidx);
+        reader.TryReadStruct<float>(lbl + Poe2.UiElement.LocalScaleMul, out var smul);
         reader.TryReadStruct<uint>(lbl + Poe2.UiElement.Flags, out var flags);
         var vis = (flags & (1u << Poe2.UiElement.FlagVisibleBit)) != 0;
         var (ux, uy) = RfUnscaledPos(reader, lbl, 0);
@@ -4700,8 +4698,8 @@ static int RunLootCursor(ProcessHandle process, MemoryReader reader)
 
     (float x, float y, float w, float h, bool ok) Rect(nint el)
     {
-        reader.TryReadStruct<byte>(el + 0x18A, out var sidx);
-        reader.TryReadStruct<float>(el + 0x130, out var smul);
+        reader.TryReadStruct<byte>(el + Poe2.UiElement.ScaleIndex, out var sidx);
+        reader.TryReadStruct<float>(el + Poe2.UiElement.LocalScaleMul, out var smul);
         reader.TryReadStruct<float>(el + Poe2.UiElement.SizeW, out var sw);
         reader.TryReadStruct<float>(el + Poe2.UiElement.SizeH, out var sh);
         var (ux, uy) = RfUnscaledPos(reader, el, 0);
@@ -5254,8 +5252,8 @@ static int RunPageDiff(MemoryReader reader, string tag, nint lo, nint hi, string
 // (stride 0x300); IntPtr idString -> UTF-16 "MapXxx"}. Seeded from a known entry (found via
 // --find-range on a map's dat row), it snaps to entry alignment, walks backward then forward while
 // entries validate (idString points to "Map..." text), and prints the count + each map's code/name.
-// This is the set of map TYPES the client has parsed — the "what data is present" inventory. (Per-
-// node Atlas STATE — tier/content/completion/position — is a separate model, still TBD.)
+// This is the set of map TYPES the client has parsed — the "what data is present" inventory. Per-node
+// State, MapRowIndex, Biome, Flags, Completion candidate, and ContentIds are read by the node probes.
 // Load the map-type catalog: array of 0x18-byte {int id; IntPtr parsedObj; IntPtr idStr->"MapXxx"}.
 static List<(nint e, int id, nint obj, string code)> LoadCatalog(MemoryReader reader, nint seed)
 {
@@ -5434,92 +5432,47 @@ static int RunAtlasFields(ProcessHandle process, MemoryReader reader, string cod
     return 0;
 }
 
-// ── Atlas nodes v2: validate the community-sourced Atlas-node ELEMENT layout (2026-06-07 notes) ──
-// Atlas nodes ARE UiElements. Walk the UI tree (Self@+0x08, children begin/end @ +0x10/+0x18), group
-// by vtable (+0x00); the atlas-node class shows up as a vtable with many instances whose biome byte
-// (+0x32E) is in 0..12. Dump that class's fields to confirm the offsets against the live atlas:
-//   +0x300 u32 map-node id | +0x310 content | +0x32E u8 biome(0..12) | +0x32F flags(bit0 unlocked,
-//   bit1 visited) | +0x339 completion id | Element +0x118 pos(x,y floats) | +0x288/+0x28C size W/H.
+// ── Atlas nodes v2: validate the current Atlas-node element layout ─────────────────────────────
+// Atlas nodes are UiElements. Current per-node fields are direct bytes at 0x31C..0x31F and the
+// ContentIds field is a guarded std::vector<byte> at 0x368/0x370/0x378.
 static int RunAtlasNodes2(ProcessHandle process, MemoryReader reader)
 {
     var (_, igs, _, _) = ResolveChain(process, reader);
     if (igs == 0) { Console.Error.WriteLine("no chain (in game?)."); return 1; }
-    var uiRoot = SafePtr(reader, igs + 0x2F0);
-    var trueRoot = SafePtr(reader, uiRoot + 0xB8);            // notes: true UI root = *(UiRoot+0xB8)
-    var root = trueRoot != 0 ? trueRoot : uiRoot;
-    Console.WriteLine($"InGameState 0x{igs:X}  UiRoot 0x{uiRoot:X}  trueRoot 0x{root:X}");
+    var (vtable, canvas, nodes) = FindAtlasNodeClass(reader, igs);
+    if (vtable == 0) { Console.Error.WriteLine("no atlas-node class found (open the Atlas map view)."); return 1; }
 
-    // BFS the element tree.
-    var queue = new Queue<nint>(); queue.Enqueue(root);
-    var visited = new HashSet<nint>();
-    var elements = new List<nint>();
-    while (queue.Count > 0 && visited.Count < 200000)
-    {
-        var el = queue.Dequeue();
-        if (el == 0 || !visited.Add(el)) continue;
-        if (SafePtr(reader, el + 0x08) != el) continue;       // Element self-ref validation
-        elements.Add(el);
-        var first = SafePtr(reader, el + 0x10);
-        if (first != 0 && reader.TryReadStruct<nint>(el + 0x18, out var last))
-        {
-            var n = ((long)last - (long)first) / 8;
-            if (n is > 0 and <= 16384)
-                for (long k = 0; k < n; k++) queue.Enqueue(SafePtr(reader, first + (nint)(k * 8)));
-        }
-    }
-    Console.WriteLine($"{elements.Count} elements.");
+    var atlas = new POE2Radar.Core.Game.Poe2Atlas(reader);
+    static string ContentName(byte id)
+        => AtlasMapData.Shared.TryGetContent(id, out var meta) ? meta.Name : $"#{id}";
 
-    // Group by vtable; for each populous vtable, count instances whose +0x32E (biome) is in 0..12.
-    var byVtable = new Dictionary<nint, List<nint>>();
-    foreach (var el in elements)
+    Console.WriteLine($"node class 0x{vtable:X}: {nodes.Count} instances, canvas 0x{canvas:X}");
+    foreach (var el in nodes.Take(20))
     {
-        var vt = SafePtr(reader, el);
-        if (vt == 0) continue;
-        (byVtable.TryGetValue(vt, out var l) ? l : byVtable[vt] = new()).Add(el);
+        reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos, out var gx);
+        reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos + 4, out var gy);
+        reader.TryReadStruct<float>(el + Poe2.UiElement.RelativePos, out var px);
+        reader.TryReadStruct<float>(el + Poe2.UiElement.RelativePos + 4, out var py);
+        reader.TryReadStruct<byte>(el + Poe2.AtlasNode.State, out var state);
+        reader.TryReadStruct<byte>(el + Poe2.AtlasNode.MapRowIndex, out var row);
+        reader.TryReadStruct<byte>(el + Poe2.AtlasNode.Biome, out var biome);
+        reader.TryReadStruct<byte>(el + Poe2.AtlasNode.Flags, out var flags);
+        reader.TryReadStruct<byte>(el + Poe2.AtlasNode.Completion, out var completion);
+        var storage = SafePtr(reader, el + Poe2.AtlasNode.DataStorage);
+        var data = storage == 0 ? 0 : SafePtr(reader, storage + Poe2.AtlasNode.DataModel);
+        byte status = 0, dataBiome = 0;
+        var statusReadable = data != 0 && reader.TryReadStruct<byte>(data + Poe2.AtlasNode.DataStatus, out status);
+        var dataBiomeReadable = data != 0 && reader.TryReadStruct<byte>(data + Poe2.AtlasNode.DataBiome, out dataBiome);
+        var deepBiome = dataBiomeReadable ? dataBiome.ToString() : "unreadable";
+        var biomeCompare = dataBiomeReadable ? (dataBiome == biome ? "match" : "MISMATCH") : "unreadable";
+        var vector = atlas.ReadContentVector(el);
+        var ids = atlas.ReadContentIds(el);
+        var names = ids.Select(ContentName);
+        Console.WriteLine($"  0x{el:X} grid=({gx},{gy}) state=0x{state:X2} row={row} biome={biome} flags=0x{flags:X2} compl={completion} " +
+            $"status={(statusReadable ? $"0x{status:X2}" : "unreadable")} deepBiome={deepBiome} ({biomeCompare}) pos=({px:F0},{py:F0}) map=\"{ReadAtlasRolledMapCode(reader, el)}\" " +
+            $"contentVec=({vector.Begin:X},{vector.End:X},{vector.Capacity:X}) count={vector.Count} valid={vector.Valid} " +
+            $"ids=[{string.Join(", ", ids)}] names=[{string.Join(", ", names)}]");
     }
-    // Rank by DISTINCT NONZERO biome values (1..12) seen across a vtable's instances AND distinct
-    // +0x300 ids — the atlas-node subclass spreads biomes across the map types; generic elements are
-    // all biome 0 / id constant.
-    Console.WriteLine("\nvtables with >=20 instances (distinctBiomes 1..12 / distinctIds among first 400):");
-    var ranked = new List<(nint vt, int count, int distinctBiomes, int distinctIds)>();
-    foreach (var (vt, list) in byVtable)
-    {
-        if (list.Count < 20) continue;
-        var biomes = new HashSet<int>(); var ids = new HashSet<uint>();
-        foreach (var el in list.Take(400))
-        {
-            if (reader.TryReadStruct<byte>(el + 0x32E, out var b) && b is >= 1 and <= 12) biomes.Add(b);
-            if (reader.TryReadStruct<uint>(el + 0x300, out var id)) ids.Add(id);
-        }
-        ranked.Add((vt, list.Count, biomes.Count, ids.Count));
-    }
-    foreach (var r in ranked.OrderByDescending(r => r.distinctIds).Take(12))
-        Console.WriteLine($"  vtable 0x{r.vt:X}  instances={r.count}  distinctBiomes={r.distinctBiomes}  distinctIds={r.distinctIds}  uniqRatio={(double)r.distinctIds / r.count:F2}");
-
-    // Dump classes that have BOTH biome variation (>=3) AND unique ids — the real map-node signature.
-    // (Decorations have biomes but reuse ids; lists/toolbars have unique ids but no biome variation.)
-    foreach (var r in ranked.Where(r => r.distinctBiomes >= 3).OrderByDescending(r => (double)r.distinctIds / r.count).Take(4))
-    {
-        var nodes = byVtable[r.vt];
-        Console.WriteLine($"\n=== vtable 0x{r.vt:X} ({r.count} instances, {r.distinctIds} distinct ids, ratio {(double)r.distinctIds / r.count:F2}) ===");
-        foreach (var el in nodes.Take(12))
-        {
-            reader.TryReadStruct<uint>(el + 0x300, out var id);
-            reader.TryReadStruct<uint>(el + 0x310, out var content);
-            reader.TryReadStruct<byte>(el + 0x32C, out var state);
-            reader.TryReadStruct<byte>(el + 0x32E, out var biome);
-            reader.TryReadStruct<byte>(el + 0x32F, out var flags);
-            reader.TryReadStruct<uint>(el + 0x339, out var compl);
-            reader.TryReadStruct<float>(el + 0x118, out var px);
-            reader.TryReadStruct<float>(el + 0x11C, out var py);
-            reader.TryReadStruct<float>(el + 0x288, out var sw);
-            reader.TryReadStruct<float>(el + 0x28C, out var sh);
-            reader.TryReadStruct<uint>(el + 0x180, out var fl);
-            Console.WriteLine($"  0x{el:X}  id={id,-10} content={content,-10} state={state} biome={biome,-2} " +
-                $"flags=0x{flags:X2} compl={compl,-4} pos=({px:F0},{py:F0}) size=({sw:F0}x{sh:F0}) shown={((fl >> 0x0B) & 1)}");
-        }
-    }
-    Console.WriteLine("\nThe REAL map-node class: unique id per instance (ratio≈1), sensible size, flags vary with progress.");
     return 0;
 }
 
@@ -5545,7 +5498,6 @@ static int RunAtlasCorr(ProcessHandle process, MemoryReader reader, bool solve, 
     nint bestEl = 0; double bestD = 1e18, brx = 0, bry = 0;
     foreach (var n in vis)
     {
-        if (n.IconType != 0) continue; // only the actual clickable TILES (type>0 = content tags offset above)
         double x = n.X, y = n.Y, w = h[6] * x + h[7] * y + 1; if (Math.Abs(w) < 1e-6) continue;
         double sx = (h[0] * x + h[1] * y + h[2]) / w, sy = (h[3] * x + h[4] * y + h[5]) / w;
         double d = (sx - cx) * (sx - cx) + (sy - cy) * (sy - cy);
@@ -5705,15 +5657,13 @@ static int RunAtlasFindPos(ProcessHandle process, MemoryReader reader)
     return 0;
 }
 
-// ── Atlas any-hover: watch EVERY UI element's flags; the one that flips on hover is the node ─────
-// Class-agnostic: snapshot +0x180 (UI flags) for all elements, poll, report any element whose flags
-// change as the user hovers atlas map nodes. Whatever class the node is, hovering highlights it → its
-// flags flip → we catch it (with its vtable + fields), pinning the real map-node class definitively.
+// ── Atlas any-hover: watch every UI element's flags for hover changes ──────────────────────────
+// Class-agnostic: snapshot the configured UiElement.Flags field and report elements that change.
 static int RunAtlasAnyHover(ProcessHandle process, MemoryReader reader)
 {
     var (_, igs, _, _) = ResolveChain(process, reader);
     if (igs == 0) { Console.Error.WriteLine("no chain."); return 1; }
-    var uiRoot = SafePtr(reader, igs + 0x2F0);
+    var uiRoot = SafePtr(reader, igs + Poe2.InGameState.UiRoot);
     var root = SafePtr(reader, uiRoot + 0xB8) is var tr && tr != 0 ? tr : uiRoot;
 
     var queue = new Queue<nint>(); queue.Enqueue(root);
@@ -5728,24 +5678,23 @@ static int RunAtlasAnyHover(ProcessHandle process, MemoryReader reader)
         if (first != 0 && reader.TryReadStruct<nint>(el + 0x18, out var last))
         { var n = ((long)last - (long)first) / 8; if (n is > 0 and <= 16384) for (long k = 0; k < n; k++) queue.Enqueue(SafePtr(reader, first + (nint)(k * 8))); }
     }
-    Console.WriteLine($"watching {els.Count} elements' +0x180 flags. Hover atlas MAP NODES slowly. Ctrl+C to stop.\n");
+    Console.WriteLine($"watching {els.Count} elements' Flags(+0x{Poe2.UiElement.Flags:X}). Hover atlas MAP NODES slowly. Ctrl+C to stop.\n");
     var arr = els.ToArray();
     var prev = new uint[arr.Length];
-    for (var i = 0; i < arr.Length; i++) { reader.TryReadStruct<uint>(arr[i] + 0x180, out var f); prev[i] = f; }
+    for (var i = 0; i < arr.Length; i++) { reader.TryReadStruct<uint>(arr[i] + Poe2.UiElement.Flags, out var f); prev[i] = f; }
 
     while (true)
     {
         for (var i = 0; i < arr.Length; i++)
         {
-            if (!reader.TryReadStruct<uint>(arr[i] + 0x180, out var f) || f == prev[i]) continue;
+            if (!reader.TryReadStruct<uint>(arr[i] + Poe2.UiElement.Flags, out var f) || f == prev[i]) continue;
             var el = arr[i];
             var vt = SafePtr(reader, el);
-            reader.TryReadStruct<uint>(el + 0x300, out var id);
-            reader.TryReadStruct<uint>(el + 0x310, out var content);
-            reader.TryReadStruct<byte>(el + 0x32E, out var biome);
-            reader.TryReadStruct<float>(el + 0x118, out var px); reader.TryReadStruct<float>(el + 0x11C, out var py);
-            reader.TryReadStruct<float>(el + 0x288, out var sw); reader.TryReadStruct<float>(el + 0x28C, out var sh);
-            Console.WriteLine($"[flip] 0x{el:X} vt=0x{vt:X} flags 0x{prev[i]:X8}->0x{f:X8} id={id} content={content} biome={biome} pos=({px:F0},{py:F0}) size=({sw:F0}x{sh:F0})");
+            reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos, out var gx);
+            reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos + 4, out var gy);
+            reader.TryReadStruct<float>(el + Poe2.UiElement.RelativePos, out var px); reader.TryReadStruct<float>(el + Poe2.UiElement.RelativePos + 4, out var py);
+            reader.TryReadStruct<float>(el + Poe2.UiElement.SizeW, out var sw); reader.TryReadStruct<float>(el + Poe2.UiElement.SizeH, out var sh);
+            Console.WriteLine($"[flip] 0x{el:X} vt=0x{vt:X} flags 0x{prev[i]:X8}->0x{f:X8} grid=({gx},{gy}) map=\"{ReadAtlasRolledMapCode(reader, el)}\" pos=({px:F0},{py:F0}) size=({sw:F0}x{sh:F0})");
             prev[i] = f;
         }
         Thread.Sleep(200);
@@ -5762,7 +5711,7 @@ static int RunAtlasMapName(ProcessHandle process, MemoryReader reader, int maxDi
 {
     var (_, igs, _, _) = ResolveChain(process, reader);
     if (igs == 0) { Console.Error.WriteLine("no chain."); return 1; }
-    var uiRoot = SafePtr(reader, igs + 0x2F0);
+    var uiRoot = SafePtr(reader, igs + Poe2.InGameState.UiRoot);
     var root = SafePtr(reader, uiRoot + 0xB8) is var tr && tr != 0 ? tr : uiRoot;
 
     var queue = new Queue<nint>(); queue.Enqueue(root);
@@ -5825,16 +5774,13 @@ static void ScanRowForNames(MemoryReader reader, nint row, string indent)
     }
 }
 
-// ── Atlas hover-flag diff: confirm WHICH element class/node the game highlights on hover ────────
-// Snapshot every element of the candidate class's UI flags (+0x180) + state bytes; poll while the user
-// hovers atlas map nodes. The element whose flags change on hover IS the hovered map node — proving
-// the class and revealing the hover-highlight bit. If NOTHING changes, that class isn't hover-reactive
-// (decoration), and we try another. Seed class via --vt; default = the biome-bearing scattered class.
+// ── Atlas hover-flag diff: confirm which element class the game highlights on hover ────────────
+// Watch the current UI flags and node state. Without --vt, use the GridPos-based node detector.
 static int RunAtlasHoverFlag(ProcessHandle process, MemoryReader reader, nint seedVt)
 {
     var (_, igs, _, _) = ResolveChain(process, reader);
     if (igs == 0) { Console.Error.WriteLine("no chain."); return 1; }
-    var uiRoot = SafePtr(reader, igs + 0x2F0);
+    var uiRoot = SafePtr(reader, igs + Poe2.InGameState.UiRoot);
     var root = SafePtr(reader, uiRoot + 0xB8) is var tr && tr != 0 ? tr : uiRoot;
 
     var queue = new Queue<nint>(); queue.Enqueue(root);
@@ -5850,34 +5796,44 @@ static int RunAtlasHoverFlag(ProcessHandle process, MemoryReader reader, nint se
         if (first != 0 && reader.TryReadStruct<nint>(el + 0x18, out var last))
         { var n = ((long)last - (long)first) / 8; if (n is > 0 and <= 16384) for (long k = 0; k < n; k++) queue.Enqueue(SafePtr(reader, first + (nint)(k * 8))); }
     }
+    List<nint> els;
     if (seedVt == 0)
     {
-        var bestB = 0;
-        foreach (var (vt, list) in byVtable)
-        { if (list.Count < 50) continue; var b = new HashSet<int>(); foreach (var el in list.Take(400)) if (reader.TryReadStruct<byte>(el + 0x32E, out var bb) && bb is >= 1 and <= 12) b.Add(bb); if (b.Count > bestB && list.Count > 200) { bestB = b.Count; seedVt = vt; } }
+        var detected = FindAtlasNodeClass(reader, igs);
+        seedVt = detected.vt;
+        els = detected.nodes;
     }
-    if (!byVtable.TryGetValue(seedVt, out var els)) { Console.Error.WriteLine($"class 0x{seedVt:X} not found."); return 1; }
+    else if (byVtable.TryGetValue(seedVt, out var selected))
+    {
+        els = selected;
+    }
+    else
+    {
+        Console.Error.WriteLine($"class 0x{seedVt:X} not found.");
+        return 1;
+    }
+    if (seedVt == 0 || els.Count == 0) { Console.Error.WriteLine("no atlas-node class found."); return 1; }
     Console.WriteLine($"watching {els.Count} elements of class 0x{seedVt:X} for hover-flag changes.");
     Console.WriteLine("Hover atlas MAP NODES slowly. The element that changes = the hovered node. Ctrl+C to stop.\n");
 
-    // Baseline a few state words per element: UI flags +0x180, +0x32C/+0x32F bytes packed.
+    // Baseline the configured UI flags and the current direct node state byte.
     var prevFlags = new Dictionary<nint, uint>();
-    var prevState = new Dictionary<nint, uint>();
+    var prevState = new Dictionary<nint, byte>();
     foreach (var el in els)
-    { reader.TryReadStruct<uint>(el + 0x180, out var f); prevFlags[el] = f; reader.TryReadStruct<uint>(el + 0x32C, out var s); prevState[el] = s; }
+    { reader.TryReadStruct<uint>(el + Poe2.UiElement.Flags, out var f); prevFlags[el] = f; reader.TryReadStruct<byte>(el + Poe2.AtlasNode.State, out var s); prevState[el] = s; }
 
     while (true)
     {
         foreach (var el in els)
         {
-            reader.TryReadStruct<uint>(el + 0x180, out var f);
-            reader.TryReadStruct<uint>(el + 0x32C, out var s);
+            reader.TryReadStruct<uint>(el + Poe2.UiElement.Flags, out var f);
+            reader.TryReadStruct<byte>(el + Poe2.AtlasNode.State, out var s);
             if (f != prevFlags[el] || s != prevState[el])
             {
-                reader.TryReadStruct<uint>(el + 0x300, out var id);
-                reader.TryReadStruct<byte>(el + 0x32E, out var biome);
-                reader.TryReadStruct<float>(el + 0x118, out var px); reader.TryReadStruct<float>(el + 0x11C, out var py);
-                Console.WriteLine($"[hover] 0x{el:X} id={id} biome={biome} pos=({px:F0},{py:F0})  flags 0x{prevFlags[el]:X8}->0x{f:X8}  state 0x{prevState[el]:X8}->0x{s:X8}");
+                reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos, out var gx);
+                reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos + 4, out var gy);
+                reader.TryReadStruct<float>(el + Poe2.UiElement.RelativePos, out var px); reader.TryReadStruct<float>(el + Poe2.UiElement.RelativePos + 4, out var py);
+                Console.WriteLine($"[hover] 0x{el:X} grid=({gx},{gy}) map=\"{ReadAtlasRolledMapCode(reader, el)}\" pos=({px:F0},{py:F0})  flags 0x{prevFlags[el]:X8}->0x{f:X8}  state 0x{prevState[el]:X2}->0x{s:X2}");
                 prevFlags[el] = f; prevState[el] = s;
             }
         }
@@ -5894,66 +5850,30 @@ static int RunAtlasCanvas(ProcessHandle process, MemoryReader reader, nint seedV
 {
     var (_, igs, _, _) = ResolveChain(process, reader);
     if (igs == 0) { Console.Error.WriteLine("no chain."); return 1; }
-    var uiRoot = SafePtr(reader, igs + 0x2F0);
-    var root = SafePtr(reader, uiRoot + 0xB8) is var tr && tr != 0 ? tr : uiRoot;
+    var (vtable, canvas, _) = FindAtlasNodeClass(reader, igs);
+    if (vtable == 0 || canvas == 0) { Console.Error.WriteLine("no atlas-node class/canvas found."); return 1; }
+    if (seedVt != 0 && seedVt != vtable) Console.WriteLine($"requested class 0x{seedVt:X}; current GridPos detector selected 0x{vtable:X}");
 
-    // BFS to find the biome-decoration class (biome 0..12 varies, 40×40), then its parent = canvas.
-    var queue = new Queue<nint>(); queue.Enqueue(root);
-    var visited = new HashSet<nint>();
-    var byVtable = new Dictionary<nint, List<nint>>();
-    while (queue.Count > 0 && visited.Count < 200000)
+    var first = SafePtr(reader, canvas + Poe2.UiElement.Children);
+    reader.TryReadStruct<nint>(canvas + Poe2.UiElement.Children + 8, out var last);
+    var count = first == 0 ? 0 : ((long)last - (long)first) / 8;
+    var groups = new Dictionary<nint, List<nint>>();
+    for (long i = 0; i < count && i < 50_000; i++)
     {
-        var el = queue.Dequeue();
-        if (el == 0 || !visited.Add(el) || SafePtr(reader, el + 0x08) != el) continue;
+        var el = SafePtr(reader, first + (nint)(i * 8));
+        if (el == 0 || SafePtr(reader, el + Poe2.UiElement.Self) != el) continue;
         var vt = SafePtr(reader, el);
-        if (vt != 0) (byVtable.TryGetValue(vt, out var l) ? l : byVtable[vt] = new()).Add(el);
-        var first = SafePtr(reader, el + 0x10);
-        if (first != 0 && reader.TryReadStruct<nint>(el + 0x18, out var last))
-        { var n = ((long)last - (long)first) / 8; if (n is > 0 and <= 16384) for (long k = 0; k < n; k++) queue.Enqueue(SafePtr(reader, first + (nint)(k * 8))); }
+        (groups.TryGetValue(vt, out var list) ? list : groups[vt] = new()).Add(el);
     }
-    nint decoVt = seedVt;
-    if (decoVt == 0)
+    Console.WriteLine($"canvas 0x{canvas:X}: {count} children, node class 0x{vtable:X}");
+    foreach (var (vt, list) in groups.OrderByDescending(x => x.Value.Count))
     {
-        var bestB = 0;
-        foreach (var (vt, list) in byVtable)
+        Console.WriteLine($"  class 0x{vt:X}: {list.Count} children");
+        foreach (var el in list.Take(3))
         {
-            if (list.Count < 50) continue;
-            var b = new HashSet<int>();
-            foreach (var el in list.Take(400)) if (reader.TryReadStruct<byte>(el + 0x32E, out var bb) && bb is >= 1 and <= 12) b.Add(bb);
-            if (b.Count > bestB && list.Count is > 200) { bestB = b.Count; decoVt = vt; }
-        }
-    }
-    if (decoVt == 0 || !byVtable.ContainsKey(decoVt)) { Console.Error.WriteLine($"class 0x{decoVt:X} not found (in the Atlas?)."); return 1; }
-    var canvas = SafePtr(reader, byVtable[decoVt][0] + 0xB8);
-    Console.WriteLine($"seed class 0x{decoVt:X} ({byVtable[decoVt].Count}); parent canvas 0x{canvas:X}");
-
-    // Enumerate canvas children by class.
-    var cFirst = SafePtr(reader, canvas + 0x10);
-    reader.TryReadStruct<nint>(canvas + 0x18, out var cLast);
-    var cCount = cFirst == 0 ? 0 : ((long)cLast - (long)cFirst) / 8;
-    Console.WriteLine($"canvas has {cCount} direct children. Classes:");
-    var childByVt = new Dictionary<nint, List<nint>>();
-    for (long i = 0; i < cCount && i < 50000; i++)
-    {
-        var ch = SafePtr(reader, cFirst + (nint)(i * 8));
-        if (ch == 0 || SafePtr(reader, ch + 0x08) != ch) continue;
-        var vt = SafePtr(reader, ch);
-        (childByVt.TryGetValue(vt, out var l) ? l : childByVt[vt] = new()).Add(ch);
-    }
-    foreach (var (vt, list) in childByVt.OrderByDescending(k => k.Value.Count))
-    {
-        Console.WriteLine($"\n  class 0x{vt:X}: {list.Count} children");
-        foreach (var el in list.Take(5))
-        {
-            reader.TryReadStruct<uint>(el + 0x300, out var id);
-            reader.TryReadStruct<uint>(el + 0x310, out var content);
-            reader.TryReadStruct<byte>(el + 0x32E, out var biome);
-            reader.TryReadStruct<byte>(el + 0x32F, out var flags);
-            reader.TryReadStruct<float>(el + 0x118, out var px);
-            reader.TryReadStruct<float>(el + 0x11C, out var py);
-            reader.TryReadStruct<float>(el + 0x288, out var sw);
-            reader.TryReadStruct<float>(el + 0x28C, out var sh);
-            Console.WriteLine($"      0x{el:X} id={id} content={content} biome={biome} flags=0x{flags:X2} pos=({px:F0},{py:F0}) size=({sw:F0}x{sh:F0})");
+            reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos, out var gx);
+            reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos + 4, out var gy);
+            Console.WriteLine($"    0x{el:X} grid=({gx},{gy}) map=\"{ReadAtlasRolledMapCode(reader, el)}\"");
         }
     }
     return 0;
@@ -5969,37 +5889,10 @@ static int RunAtlasXform(ProcessHandle process, MemoryReader reader)
 {
     var (_, igs, _, _) = ResolveChain(process, reader);
     if (igs == 0) { Console.Error.WriteLine("no chain."); return 1; }
-    var uiRoot = SafePtr(reader, igs + 0x2F0);
-    var root = SafePtr(reader, uiRoot + 0xB8) is var tr && tr != 0 ? tr : uiRoot;
-
-    // BFS, group by vtable, pick the atlas-node class (most distinct nonzero biomes among instances).
-    var queue = new Queue<nint>(); queue.Enqueue(root);
-    var visited = new HashSet<nint>();
-    var byVtable = new Dictionary<nint, List<nint>>();
-    while (queue.Count > 0 && visited.Count < 200000)
-    {
-        var el = queue.Dequeue();
-        if (el == 0 || !visited.Add(el) || SafePtr(reader, el + 0x08) != el) continue;
-        var vt = SafePtr(reader, el);
-        if (vt != 0) (byVtable.TryGetValue(vt, out var l) ? l : byVtable[vt] = new()).Add(el);
-        var first = SafePtr(reader, el + 0x10);
-        if (first != 0 && reader.TryReadStruct<nint>(el + 0x18, out var last))
-        {
-            var n = ((long)last - (long)first) / 8;
-            if (n is > 0 and <= 16384) for (long k = 0; k < n; k++) queue.Enqueue(SafePtr(reader, first + (nint)(k * 8)));
-        }
-    }
-    nint nodeVt = 0; var bestBiomes = 0;
-    foreach (var (vt, list) in byVtable)
-    {
-        if (list.Count < 50) continue;
-        var biomes = new HashSet<int>();
-        foreach (var el in list.Take(400)) if (reader.TryReadStruct<byte>(el + 0x32E, out var b) && b is >= 1 and <= 12) biomes.Add(b);
-        if (biomes.Count > bestBiomes) { bestBiomes = biomes.Count; nodeVt = vt; }
-    }
-    if (nodeVt == 0) { Console.Error.WriteLine("no atlas-node class found (in the Atlas?)."); return 1; }
-    var node = byVtable[nodeVt][0];
-    Console.WriteLine($"node class vtable 0x{nodeVt:X} ({byVtable[nodeVt].Count} nodes). Sample node 0x{node:X}.");
+    var (nodeVt, _, nodes) = FindAtlasNodeClass(reader, igs);
+    if (nodeVt == 0 || nodes.Count == 0) { Console.Error.WriteLine("no atlas-node class found (open the Atlas)."); return 1; }
+    var node = nodes[0];
+    Console.WriteLine($"node class vtable 0x{nodeVt:X} ({nodes.Count} nodes). Sample node 0x{node:X}.");
 
     // Ancestor chain via Parent (+0xB8).
     var chain = new List<nint>(); var cur = node; var guard = 0;
@@ -6007,9 +5900,9 @@ static int RunAtlasXform(ProcessHandle process, MemoryReader reader)
     Console.WriteLine($"ancestor chain (node → root), {chain.Count} levels:");
     foreach (var (a, i) in chain.Select((a, i) => (a, i)))
     {
-        reader.TryReadStruct<float>(a + 0x118, out var rx); reader.TryReadStruct<float>(a + 0x11C, out var ry);
-        reader.TryReadStruct<float>(a + 0x130, out var scale);
-        reader.TryReadStruct<float>(a + 0x288, out var sw); reader.TryReadStruct<float>(a + 0x28C, out var sh);
+        reader.TryReadStruct<float>(a + Poe2.UiElement.RelativePos, out var rx); reader.TryReadStruct<float>(a + Poe2.UiElement.RelativePos + 4, out var ry);
+        reader.TryReadStruct<float>(a + Poe2.UiElement.LocalScaleMul, out var scale);
+        reader.TryReadStruct<float>(a + Poe2.UiElement.SizeW, out var sw); reader.TryReadStruct<float>(a + Poe2.UiElement.SizeH, out var sh);
         Console.WriteLine($"  [{i,2}] 0x{a:X} vt=0x{SafePtr(reader, a):X} relPos=({rx:F1},{ry:F1}) scale={scale:G5} size=({sw:F0}x{sh:F0})");
     }
     Console.WriteLine("\nNow ZOOM the atlas in/out. Watching relPos(+0x118) AND scale(+0x130) per ancestor.");
@@ -6022,8 +5915,8 @@ static int RunAtlasXform(ProcessHandle process, MemoryReader reader)
         for (var i = 0; i < chain.Count; i++)
         {
             var a = chain[i];
-            reader.TryReadStruct<float>(a + 0x118, out var rx); reader.TryReadStruct<float>(a + 0x11C, out var ry);
-            reader.TryReadStruct<float>(a + 0x130, out var sc);
+            reader.TryReadStruct<float>(a + Poe2.UiElement.RelativePos, out var rx); reader.TryReadStruct<float>(a + Poe2.UiElement.RelativePos + 4, out var ry);
+            reader.TryReadStruct<float>(a + Poe2.UiElement.LocalScaleMul, out var sc);
             if (prev.TryGetValue(a, out var old) &&
                 (MathF.Abs(old.rx - rx) > 0.5f || MathF.Abs(old.ry - ry) > 0.5f || MathF.Abs(old.sc - sc) > 0.001f))
                 Console.WriteLine($"  [{i,2}] 0x{a:X} relPos ({old.rx:F1},{old.ry:F1})->({rx:F1},{ry:F1})  scale {old.sc:F4}->{sc:F4}");
@@ -6037,115 +5930,101 @@ static int RunAtlasXform(ProcessHandle process, MemoryReader reader)
 // This is THE command to run after a patch breaks the atlas overlay. It re-locates the node class +
 // canvas, validates every field offset with sanity checks (flagging drift), prints the ancestor chain
 // with its scales (the zoom propagation), DERIVES the full projection from memory + window metrics,
-// and prints a paste-ready offset block for Poe2Offsets.cs. The projection model (validated live
-// 2026-06-07): screen = (UIscale × zoom) × relPos + offset, where
-//   • relPos  = node UiElement +0x118 (read live; already includes PAN)
-//   • zoom    = node/canvas scale +0x130 (read live; 0.85 at max zoom-out, larger zoomed in)
-//   • UIscale = winH / 1600 (design height); offset = canvas-origin screen pos ≈ factor × halfIcon.
+// and prints a paste-ready offset block for Poe2Offsets.cs. Projection is:
+// screen = (UIscale × zoom) × RelativePos + offset, using the named UiElement fields.
 static int RunAtlasProbe(ProcessHandle process, MemoryReader reader)
 {
     var (_, igs, _, _) = ResolveChain(process, reader);
     if (igs == 0) { Console.Error.WriteLine("no chain (in game?)."); return 1; }
-    var uiRoot = SafePtr(reader, igs + 0x2F0);
-    var root = SafePtr(reader, uiRoot + 0xB8) is var tr && tr != 0 ? tr : uiRoot;
     Console.WriteLine("ATLAS PROJECTION PROBE — recovery + validation\n==============================================");
+    var (nodeVt, canvas, nodes) = FindAtlasNodeClass(reader, igs);
+    if (nodeVt == 0 || canvas == 0)
+    {
+        Console.Error.WriteLine("FAIL: no atlas-node class found. Open the Atlas MAP view, then re-run.");
+        return 1;
+    }
+    Console.WriteLine($"[1] node class vtable = 0x{nodeVt:X} ({nodes.Count} instances) — module +0x{(long)nodeVt - (long)process.MainModuleBase:X}");
+    Console.WriteLine($"[2] canvas = 0x{canvas:X}");
 
-    // 1) BFS the UI tree, group by vtable, pick the atlas-node class = the vtable whose instances spread
-    //    across the most distinct biome values (generic elements are all biome 0).
-    var queue = new Queue<nint>(); queue.Enqueue(root);
-    var visited = new HashSet<nint>();
-    var byVtable = new Dictionary<nint, List<nint>>();
-    while (queue.Count > 0 && visited.Count < 200000)
+    var vcur = canvas; var vguard = 0; var visible = true;
+    var visibility = new System.Text.StringBuilder();
+    while (vcur != 0 && vguard++ < 16)
     {
-        var el = queue.Dequeue();
-        if (el == 0 || !visited.Add(el) || SafePtr(reader, el + 0x08) != el) continue;
-        var vt = SafePtr(reader, el);
-        if (vt != 0) (byVtable.TryGetValue(vt, out var l) ? l : byVtable[vt] = new()).Add(el);
-        var first = SafePtr(reader, el + 0x10);
-        if (first != 0 && reader.TryReadStruct<nint>(el + 0x18, out var last))
-        { var n = ((long)last - (long)first) / 8; if (n is > 0 and <= 16384) for (long k = 0; k < n; k++) queue.Enqueue(SafePtr(reader, first + (nint)(k * 8))); }
+        reader.TryReadStruct<uint>(vcur + Poe2.UiElement.Flags, out var flags);
+        var bit = ((flags >> Poe2.UiElement.FlagVisibleBit) & 1) != 0;
+        visibility.Append($"0x{vcur:X}[fl=0x{flags:X} vis={(bit ? 1 : 0)}] → ");
+        if (!bit) visible = false;
+        var parent = SafePtr(reader, vcur + Poe2.UiElement.Parent);
+        if (parent == vcur || parent == 0) break;
+        vcur = parent;
     }
-    // Score every candidate vtable on THREE independent signals so a stray biome-ish list can't win:
-    //   • biome spread (distinct 1..12)   • modal size ≈ 40×40   • instance count (atlas has ~1000+).
-    // The real atlas-node class is the one that's ~40×40 AND biome-spread ≥3 AND has the most instances.
-    nint nodeVt = 0; var bestBiomes = 0; (float w, float h) bestSize = (0, 0); var ranked = new List<(nint vt, int count, int biomes, float w, float h)>();
-    foreach (var (vt, list) in byVtable)
-    {
-        if (list.Count < 50) continue;
-        var biomes = new HashSet<int>(); var szs = new List<(float, float)>();
-        foreach (var el in list.Take(400))
-        {
-            if (reader.TryReadStruct<byte>(el + 0x32E, out var b) && b is >= 1 and <= 12) biomes.Add(b);
-            if (reader.TryReadStruct<float>(el + 0x288, out var sw) && reader.TryReadStruct<float>(el + 0x28C, out var sh)) szs.Add((sw, sh));
-        }
-        var modal = szs.GroupBy(s => ((int)s.Item1, (int)s.Item2)).OrderByDescending(g => g.Count()).FirstOrDefault()?.Key ?? (0, 0);
-        ranked.Add((vt, list.Count, biomes.Count, modal.Item1, modal.Item2));
-    }
-    // Prefer ~40×40 AND biome-spread≥3, then max instance count. Fall back to max biome-spread if none qualify.
-    var qualified = ranked.Where(r => r.w is >= 28 and <= 56 && r.biomes >= 3).OrderByDescending(r => r.count).ToList();
-    var pick = qualified.FirstOrDefault();
-    if (pick.vt == 0) { pick = ranked.OrderByDescending(r => r.biomes).ThenByDescending(r => r.count).FirstOrDefault(); if (pick.vt != 0) Console.WriteLine("    (no ~40×40 biome class — falling back to max biome-spread; verify the Atlas map view is open)"); }
-    if (pick.vt == 0) { Console.Error.WriteLine("FAIL: no atlas-node class found. Open the Atlas MAP view (Endgame tab), then re-run."); return 1; }
-    nodeVt = pick.vt; bestBiomes = pick.biomes; bestSize = (pick.w, pick.h);
-    var nodes = byVtable[nodeVt];
-    Console.WriteLine($"[1] node class vtable = 0x{nodeVt:X}  ({nodes.Count} instances, {bestBiomes} distinct biomes, size {bestSize.w:F0}x{bestSize.h:F0}) — module +0x{(long)nodeVt - (long)process.MainModuleBase:X}");
-    if (nodes.Count < 200) Console.WriteLine($"    ⚠ only {nodes.Count} instances — expected ~1000+. The Atlas map view may not be open; results below may be wrong.");
-
-    // 2) Canvas = the parent holding the MOST node-class children.
-    var parentCount = new Dictionary<nint, int>();
-    foreach (var el in nodes) { var p = SafePtr(reader, el + 0xB8); if (p != 0) parentCount[p] = parentCount.GetValueOrDefault(p) + 1; }
-    var canvas = parentCount.OrderByDescending(k => k.Value).First();
-    Console.WriteLine($"[2] canvas = 0x{canvas.Key:X}  (holds {canvas.Value} node-class children)");
-    // Replicate the overlay's HierarchicallyVisible gate on the canvas (walk Parent +0xB8, check Flags
-    // +0x180 bit 0x0B) — this is what decides whether the overlay reads nodes. If it reports HIDDEN while
-    // the atlas is clearly open, the gate is the bug.
-    {
-        var vcur = canvas.Key; var vguard = 0; var visible = true; var sbv = new System.Text.StringBuilder();
-        while (vcur != 0 && vguard++ < 16)
-        {
-            reader.TryReadStruct<uint>(vcur + 0x180, out var fl);
-            var bit = ((fl >> 0x0B) & 1) != 0;
-            sbv.Append($"0x{vcur:X}[fl=0x{fl:X} vis={(bit ? 1 : 0)}] → ");
-            if (!bit) { visible = false; }
-            var par = SafePtr(reader, vcur + 0xB8); if (par == vcur || par == 0) break; vcur = par;
-        }
-        Console.WriteLine($"    gate HierarchicallyVisible = {visible}");
-        Console.WriteLine($"    chain: {sbv}root");
-    }
+    Console.WriteLine($"    gate HierarchicallyVisible = {visible}");
+    Console.WriteLine($"    chain: {visibility}root");
 
     // 3) Validate the per-node field offsets with sanity checks; flag drift.
     Console.WriteLine("\n[3] FIELD VALIDATION (sanity checks — PASS / ⚠ DRIFT):");
     var sample = nodes.Take(400).ToList();
-    int finiteRel = 0, distinctRel; var relSet = new HashSet<(int, int)>();
-    var scales = new List<float>(); var sizes = new List<(float, float)>(); var ids = new HashSet<uint>(); var biomeHist = new Dictionary<int, int>();
+    var atlas = new POE2Radar.Core.Game.Poe2Atlas(reader);
+    int finiteRel = 0, stateRead = 0, rowRead = 0, biomeRead = 0, flagsRead = 0, completionRead = 0;
+    int vectorsValid = 0, vectorIds = 0;
+    var relSet = new HashSet<(int, int)>();
+    var gridSet = new HashSet<(int, int)>();
+    var biomeSet = new HashSet<byte>();
+    var scales = new List<float>();
+    var sizes = new List<(float, float)>();
     foreach (var el in sample)
     {
-        if (reader.TryReadStruct<float>(el + 0x118, out var rx) && reader.TryReadStruct<float>(el + 0x11C, out var ry) && float.IsFinite(rx) && float.IsFinite(ry))
-        { finiteRel++; relSet.Add(((int)rx, (int)ry)); }
-        if (reader.TryReadStruct<float>(el + 0x130, out var sc) && sc > 0.01f && sc < 4f) scales.Add(sc);
-        if (reader.TryReadStruct<float>(el + 0x288, out var sw) && reader.TryReadStruct<float>(el + 0x28C, out var sh)) sizes.Add((sw, sh));
-        if (reader.TryReadStruct<uint>(el + 0x300, out var id)) ids.Add(id);
-        if (reader.TryReadStruct<byte>(el + 0x32E, out var bm)) biomeHist[bm] = biomeHist.GetValueOrDefault(bm) + 1;
+        if (reader.TryReadStruct<float>(el + Poe2.UiElement.RelativePos, out var rx) &&
+            reader.TryReadStruct<float>(el + Poe2.UiElement.RelativePos + 4, out var ry) &&
+            float.IsFinite(rx) && float.IsFinite(ry))
+        {
+            finiteRel++;
+            relSet.Add(((int)rx, (int)ry));
+        }
+        if (reader.TryReadStruct<byte>(el + Poe2.AtlasNode.State, out var state)) stateRead++;
+        if (reader.TryReadStruct<byte>(el + Poe2.AtlasNode.MapRowIndex, out var mapRow)) rowRead++;
+        if (reader.TryReadStruct<byte>(el + Poe2.AtlasNode.Biome, out var biome)) { biomeRead++; biomeSet.Add(biome); }
+        if (reader.TryReadStruct<byte>(el + Poe2.AtlasNode.Flags, out _)) flagsRead++;
+        if (reader.TryReadStruct<byte>(el + Poe2.AtlasNode.Completion, out _)) completionRead++;
+        var vector = atlas.ReadContentVector(el);
+        if (vector.Valid) { vectorsValid++; vectorIds += vector.Count; }
+        if (reader.TryReadStruct<float>(el + Poe2.UiElement.LocalScaleMul, out var scale) && scale is > 0.01f and < 4f)
+            scales.Add(scale);
+        if (reader.TryReadStruct<float>(el + Poe2.UiElement.SizeW, out var width) &&
+            reader.TryReadStruct<float>(el + Poe2.UiElement.SizeH, out var height))
+            sizes.Add((width, height));
+        if (reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos, out var gx) &&
+            reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos + 4, out var gy) &&
+            gx is >= -64 and <= 64 && gy is >= 0 and <= 192)
+            gridSet.Add((gx, gy));
     }
-    distinctRel = relSet.Count;
-    scales.Sort(); var zoom = scales.Count > 0 ? scales[scales.Count / 2] : 0f;
+    scales.Sort();
+    var zoom = scales.Count > 0 ? scales[scales.Count / 2] : 0f;
     var modeSize = sizes.GroupBy(s => s).OrderByDescending(g => g.Count()).FirstOrDefault()?.Key ?? (0, 0);
     void Check(string name, int off, bool ok, string detail) => Console.WriteLine($"    {(ok ? "PASS" : "⚠ DRIFT")}  {name,-22} +0x{off:X3}  {detail}");
-    Check("RelativePos", 0x118, finiteRel > sample.Count * 0.8 && distinctRel > sample.Count / 2, $"{finiteRel}/{sample.Count} finite, {distinctRel} distinct positions");
-    Check("scale (zoom)", 0x130, zoom is > 0.05f and < 4f, $"median zoom = {zoom:F4} (expect ~0.85 at max zoom-out)");
-    Check("Size W/H", 0x288, modeSize.Item1 is >= 16 and <= 128, $"mode size = {modeSize.Item1:F0}x{modeSize.Item2:F0} (expect ~40x40)");
-    Check("MapNodeId", 0x300, ids.Count >= 20, $"{ids.Count} distinct ids over {sample.Count} nodes (a map-TYPE id, shared by same-type nodes — element addr is the unique key)");
-    Check("Biome", 0x32E, biomeHist.Keys.Count(k => k is >= 1 and <= 12) >= 3, $"biomes present: {string.Join(",", biomeHist.Keys.OrderBy(k => k))}");
+    Check("RelativePos", Poe2.UiElement.RelativePos, finiteRel > sample.Count * 0.8 && relSet.Count > sample.Count / 2, $"{finiteRel}/{sample.Count} finite, {relSet.Count} distinct");
+    Check("scale (zoom)", Poe2.UiElement.LocalScaleMul, zoom is > 0.05f and < 4f, $"median {zoom:F4}");
+    Check("Size W/H", Poe2.UiElement.SizeW, modeSize.Item1 is >= 16 and <= 160, $"mode {modeSize.Item1:F0}x{modeSize.Item2:F0}");
+    Check("GridPos", Poe2.AtlasNode.GridPos, gridSet.Count > sample.Count / 2, $"{gridSet.Count} distinct coordinates");
+    Check("State", Poe2.AtlasNode.State, stateRead > sample.Count * 0.8, $"{stateRead}/{sample.Count} readable");
+    Check("MapRowIndex", Poe2.AtlasNode.MapRowIndex, rowRead > sample.Count * 0.8, $"{rowRead}/{sample.Count} readable");
+    Check("Biome", Poe2.AtlasNode.Biome, biomeRead > sample.Count * 0.8 && biomeSet.Count > 0, $"{biomeRead}/{sample.Count} readable, values={string.Join(',', biomeSet.Order())}");
+    Check("Flags", Poe2.AtlasNode.Flags, flagsRead > sample.Count * 0.8, $"{flagsRead}/{sample.Count} readable");
+    Check("Completion candidate", Poe2.AtlasNode.Completion, completionRead > sample.Count * 0.8, $"{completionRead}/{sample.Count} readable; observational only");
+    Check("ContentIds vector", Poe2.AtlasNode.ContentIdsBegin, vectorsValid > sample.Count * 0.8, $"{vectorsValid}/{sample.Count} valid headers, {vectorIds} ids");
 
     // 4) Ancestor chain + scales (the zoom propagation — for re-deriving the chain if it moves).
     Console.WriteLine("\n[4] ANCESTOR CHAIN (node → root) with relPos + scale:");
     var chain = new List<nint>(); var cur = nodes[0]; var guard = 0;
-    while (cur != 0 && guard++ < 16) { chain.Add(cur); var par = SafePtr(reader, cur + 0xB8); if (par == cur || par == 0) break; cur = par; }
-    foreach (var (a, i) in chain.Select((a, i) => (a, i)))
+    while (cur != 0 && guard++ < 16) { chain.Add(cur); var par = SafePtr(reader, cur + Poe2.UiElement.Parent); if (par == cur || par == 0) break; cur = par; }
+    foreach (var (ancestor, i) in chain.Select((a, i) => (a, i)))
     {
-        reader.TryReadStruct<float>(a + 0x118, out var rx); reader.TryReadStruct<float>(a + 0x11C, out var ry);
-        reader.TryReadStruct<float>(a + 0x130, out var sc); reader.TryReadStruct<float>(a + 0x288, out var sw); reader.TryReadStruct<float>(a + 0x28C, out var sh);
-        Console.WriteLine($"    [{i,2}] 0x{a:X} relPos=({rx:F1},{ry:F1}) scale={sc:G5} size=({sw:F0}x{sh:F0})");
+        reader.TryReadStruct<float>(ancestor + Poe2.UiElement.RelativePos, out var rx);
+        reader.TryReadStruct<float>(ancestor + Poe2.UiElement.RelativePos + 4, out var ry);
+        reader.TryReadStruct<float>(ancestor + Poe2.UiElement.LocalScaleMul, out var scale);
+        reader.TryReadStruct<float>(ancestor + Poe2.UiElement.SizeW, out var width);
+        reader.TryReadStruct<float>(ancestor + Poe2.UiElement.SizeH, out var height);
+        Console.WriteLine($"    [{i,2}] 0x{ancestor:X} relPos=({rx:F1},{ry:F1}) scale={scale:G5} size=({width:F0}x{height:F0})");
     }
 
     // 5) Derive the projection from memory + window metrics, and print the live transform.
@@ -6162,12 +6041,13 @@ static int RunAtlasProbe(ProcessHandle process, MemoryReader reader)
     Console.WriteLine("    NOTE: a one-time F10/F11 calibration in the overlay refines the offset to ~2px (this");
     Console.WriteLine("          auto-derivation lands ~5-7px). Calibration anchors at the zoom you solved at.");
 
-    // 6) Paste-ready offsets for Poe2Offsets.cs.
-    Console.WriteLine("\n[6] PASTE-READY (Poe2Offsets.cs — re-confirm markers if any changed):");
-    Console.WriteLine("    UiElement:  Self +0x08  Children +0x10/+0x18  Parent +0xB8  RelativePos +0x118  scale +0x130  Flags +0x180 (vis bit 0x0B)  Size +0x288/+0x28C");
-    Console.WriteLine("    AtlasNode:  MapNodeId +0x300  Content +0x310  State +0x32C  Biome +0x32E  Flags +0x32F  Completion +0x339");
+    Console.WriteLine("\n[6] CURRENT OFFSETS:");
+    Console.WriteLine($"    UiElement: RelativePos +0x{Poe2.UiElement.RelativePos:X} scale +0x{Poe2.UiElement.LocalScaleMul:X} Flags +0x{Poe2.UiElement.Flags:X} Size +0x{Poe2.UiElement.SizeW:X}/+0x{Poe2.UiElement.SizeH:X}");
+    Console.WriteLine($"    AtlasNode: GridPos +0x{Poe2.AtlasNode.GridPos:X}, State +0x{Poe2.AtlasNode.State:X}, MapRowIndex +0x{Poe2.AtlasNode.MapRowIndex:X}, Biome +0x{Poe2.AtlasNode.Biome:X}, Flags +0x{Poe2.AtlasNode.Flags:X}");
+    Console.WriteLine($"               Completion candidate +0x{Poe2.AtlasNode.Completion:X}, ContentIds vector +0x{Poe2.AtlasNode.ContentIdsBegin:X}/+0x{Poe2.AtlasNode.ContentIdsEnd:X}/+0x{Poe2.AtlasNode.ContentIdsCapacity:X}");
+    Console.WriteLine($"               DataStatus +0x{Poe2.AtlasNode.DataStatus:X}, DataBiome +0x{Poe2.AtlasNode.DataBiome:X} (runtime validated 4997/4997 across 11 distinct biome values)");
+    Console.WriteLine("    VisualIdentity row/icon remains unresolved; names use the checked-in numeric content snapshot.");
     Console.WriteLine($"    node-class vtable (drifts every patch): module +0x{(long)nodeVt - (long)process.MainModuleBase:X}");
-    Console.WriteLine("\nDONE. If any line above is ⚠ DRIFT, that offset moved — re-discover with --atlas-canvas / --atlas-nodes2.");
     return 0;
 }
 
@@ -6276,14 +6156,8 @@ static int AtlasDiagSample(ProcessHandle process, MemoryReader reader, Poe2Atlas
     return chained;
 }
 
-// ── Atlas GRAPH probe: validate the upstream reference-sourced node GRID COORDINATES + CONNECTION GRAPH ──
-// (resources/upstream reference-main .../ImportantUiElements.cs). These are the two structures POE2Radar
-// currently LACKS — they're what enables node-to-node atlas pathfinding ("route from here to that map
-// in the fewest hops"). GH2 reads: grid pos @ nodeElem+0x320 (StdTuple2D<int>); connection edges @
-// atlasPanel+0x5A8 (StdVector of {int unknown; Tuple2D<int> src; Tuple2D<int> dst}); and a node-DATA
-// model two derefs in (*(*(node+0x10)+0x20)) carrying biome+0x2CE / status+0x2CF / mapId+0x2A0 chain.
-// We BRUTE-SCAN for each offset (don't trust GH2 blindly — it may be a different build) and report the
-// discovered offset + PASS/DRIFT vs GH2's value. Run with the Atlas MAP view open.
+// ── Atlas GRAPH probe: validate current node GridPos, canvas connection vector, and node-data chain.
+// Brute-scans the candidate ranges, then compares discoveries with Poe2Offsets.cs.
 static int RunAtlasGraph(ProcessHandle process, MemoryReader reader)
 {
     var (_, igs, _, _) = ResolveChain(process, reader);
@@ -6297,7 +6171,7 @@ static int RunAtlasGraph(ProcessHandle process, MemoryReader reader)
 
     // ── [1] GRID COORDINATES — scan node element +0x300..+0x360 for an (int32,int32) pair that is small
     //        (|v|≤512), finite, and highly distinct per node (a real grid coord), then report best off. ──
-    Console.WriteLine("[1] GRID COORDINATE field (expect GH2 +0x320):");
+    Console.WriteLine($"[1] GRID COORDINATE field (expect +0x{Poe2.AtlasNode.GridPos:X}):");
     (int off, int score, int distinct, int inRange, int minX, int maxX, int minY, int maxY) bestGrid = (-1, 0, 0, 0, 0, 0, 0, 0);
     for (var o = 0x300; o <= 0x35C; o += 4)
     {
@@ -6317,7 +6191,7 @@ static int RunAtlasGraph(ProcessHandle process, MemoryReader reader)
     }
     var gridOff = bestGrid.off;
     if (gridOff < 0) Console.WriteLine("    ⚠ no grid-coord-like (int,int) field found in +0x300..+0x360.");
-    else Console.WriteLine($"    {(gridOff == 0x320 ? "PASS" : "⚠ DRIFT")}  grid coords @ +0x{gridOff:X3}  (GH2=+0x320)  {bestGrid.distinct} distinct, {bestGrid.inRange}/{sample.Count} in-range, X[{bestGrid.minX}..{bestGrid.maxX}] Y[{bestGrid.minY}..{bestGrid.maxY}]");
+    else Console.WriteLine($"    {(gridOff == Poe2.AtlasNode.GridPos ? "PASS" : "⚠ DRIFT")}  grid coords @ +0x{gridOff:X3}  (configured +0x{Poe2.AtlasNode.GridPos:X})  {bestGrid.distinct} distinct, {bestGrid.inRange}/{sample.Count} in-range, X[{bestGrid.minX}..{bestGrid.maxX}] Y[{bestGrid.minY}..{bestGrid.maxY}]");
 
     // Build the grid-position set (used to validate connection edges below).
     var gridSet = new HashSet<(int, int)>();
@@ -6331,7 +6205,7 @@ static int RunAtlasGraph(ProcessHandle process, MemoryReader reader)
 
     // ── [2] CONNECTION GRAPH — scan the canvas (and the atlas panel ancestors) for a StdVector whose
     //        elements are edges {int; Tuple2D<int> src; Tuple2D<int> dst} with src+dst in the grid set. ──
-    Console.WriteLine("[2] CONNECTION edge vector (expect GH2 panel +0x5A8, edge stride 20 = {int,src,dst}):");
+    Console.WriteLine($"[2] CONNECTION edge vector (expect canvas +0x{Poe2.AtlasGraph.ConnectionsVec:X}, stride {Poe2.AtlasGraph.EdgeStride}):");
     // Candidate containers: the canvas + a few ancestors (GH2's "atlas" element may be an ancestor of
     // the canvas that actually parents the node children).
     var containers = new List<(string label, nint addr)> { ("canvas", canvas) };
@@ -6371,8 +6245,8 @@ static int RunAtlasGraph(ProcessHandle process, MemoryReader reader)
     if (bestConn.off < 0) Console.WriteLine("    ⚠ no edge vector found whose endpoints land on grid positions. (Grid offset wrong, or connections live elsewhere.)");
     else
     {
-        var on5A8 = bestConn.who == "canvas" && bestConn.off == 0x5A8;
-        Console.WriteLine($"    {(on5A8 ? "PASS" : "⚠ DRIFT")}  edges @ {bestConn.who}+0x{bestConn.off:X3}  stride {bestConn.stride}  (GH2=canvas+0x5A8 stride 20)");
+        var configured = bestConn.who == "canvas" && bestConn.off == Poe2.AtlasGraph.ConnectionsVec && bestConn.stride == Poe2.AtlasGraph.EdgeStride;
+        Console.WriteLine($"    {(configured ? "PASS" : "⚠ DRIFT")}  edges @ {bestConn.who}+0x{bestConn.off:X3} stride {bestConn.stride} (configured canvas+0x{Poe2.AtlasGraph.ConnectionsVec:X})");
         Console.WriteLine($"    {bestConn.edges} edges, {bestConn.valid}% of sampled endpoints land on real grid positions");
         // Build adjacency from the discovered vector and report degree stats — a real atlas graph is
         // sparse (most nodes 2-6 neighbours).
@@ -6393,26 +6267,54 @@ static int RunAtlasGraph(ProcessHandle process, MemoryReader reader)
     }
     Console.WriteLine();
 
-    // ── [3] node-DATA model chain (GH2: *(*(node+0x10)+0x20) → biome+0x2CE / status+0x2CF / mapId+0x2A0).
-    //        Cross-check its biome against the element's own +0x32E biome we already trust. ──
-    Console.WriteLine("[3] node-DATA model chain (GH2: *(*(node+0x10)+0x20) → +0x2CE biome / +0x2CF status / +0x2A0 mapId):");
-    int dataOk = 0, biomeMatch = 0, mapIdOk = 0, tested3 = 0; string exMap = "";
+    // ── [3] current direct node fields + ContentIds vector ───────────────────────────────────────
+    var liveAtlas = new POE2Radar.Core.Game.Poe2Atlas(reader);
+    int directTested = 0, stateOk = 0, rowOk = 0, biomeOk = 0, flagsOk = 0, completionOk = 0, vectorsOk = 0, idsSeen = 0;
+    var biomeValues = new HashSet<byte>();
+    foreach (var el in sample.Take(200))
+    {
+        directTested++;
+        if (reader.TryReadStruct<byte>(el + Poe2.AtlasNode.State, out _)) stateOk++;
+        if (reader.TryReadStruct<byte>(el + Poe2.AtlasNode.MapRowIndex, out _)) rowOk++;
+        if (reader.TryReadStruct<byte>(el + Poe2.AtlasNode.Biome, out var biome)) { biomeOk++; biomeValues.Add(biome); }
+        if (reader.TryReadStruct<byte>(el + Poe2.AtlasNode.Flags, out _)) flagsOk++;
+        if (reader.TryReadStruct<byte>(el + Poe2.AtlasNode.Completion, out _)) completionOk++;
+        var vector = liveAtlas.ReadContentVector(el);
+        if (vector.Valid) { vectorsOk++; idsSeen += vector.Count; }
+    }
+    Console.WriteLine($"[3] direct fields: State +0x{Poe2.AtlasNode.State:X}, MapRowIndex +0x{Poe2.AtlasNode.MapRowIndex:X}, " +
+        $"Biome +0x{Poe2.AtlasNode.Biome:X}, Flags +0x{Poe2.AtlasNode.Flags:X}, Completion candidate +0x{Poe2.AtlasNode.Completion:X}");
+    Console.WriteLine($"    readable state/row/biome/flags/completion = {stateOk}/{rowOk}/{biomeOk}/{flagsOk}/{completionOk}/{directTested}; " +
+        $"biomes=[{string.Join(',', biomeValues.Order())}]");
+    Console.WriteLine($"    ContentIds vector +0x{Poe2.AtlasNode.ContentIdsBegin:X}/+0x{Poe2.AtlasNode.ContentIdsEnd:X}/+0x{Poe2.AtlasNode.ContentIdsCapacity:X}: " +
+        $"{vectorsOk}/{directTested} valid headers, {idsSeen} ids; names use numeric snapshot");
+    // ── [4] node-DATA model: status and rolled map id ─────────────────────────────────────────────
+    Console.WriteLine($"[4] node-DATA model: status +0x{Poe2.AtlasNode.DataStatus:X}, mapId +0x{Poe2.AtlasNode.DataMapId:X}");
+    int dataOk = 0, statusOk = 0, mapIdOk = 0, tested3 = 0; string exMap = "";
     foreach (var el in sample.Take(200))
     {
         tested3++;
-        var storage = SafePtr(reader, el + 0x10);
+        var storage = SafePtr(reader, el + Poe2.AtlasNode.DataStorage);
         if (storage == 0) continue;
-        var data = SafePtr(reader, storage + 0x20);
+        var data = SafePtr(reader, storage + Poe2.AtlasNode.DataModel);
         if (data == 0) continue;
         dataOk++;
-        reader.TryReadStruct<byte>(el + 0x32E, out var elemBiome);          // trusted element biome
-        reader.TryReadStruct<byte>(data + 0x2CE, out var dataBiome);
-        if (elemBiome == dataBiome) biomeMatch++;
-        var wrap = SafePtr(reader, data + 0x2A0);
-        if (wrap != 0) { var hdr = SafePtr(reader, wrap); if (hdr != 0) { var buf = SafePtr(reader, hdr); var s = buf != 0 ? reader.ReadStringUtf16(buf, 64) : ""; if (s.StartsWith("Map", StringComparison.Ordinal)) { mapIdOk++; if (exMap == "") exMap = s; } } }
+        if (reader.TryReadStruct<byte>(data + Poe2.AtlasNode.DataStatus, out var status) && status <= 7) statusOk++;
+        var cur = data + Poe2.AtlasNode.DataMapId;
+        for (var hop = 0; hop < 4 && cur != 0; hop++)
+        {
+            var code = reader.ReadStringUtf16(cur, 64);
+            if (code.StartsWith("Map", StringComparison.Ordinal))
+            {
+                mapIdOk++;
+                if (exMap.Length == 0) exMap = code;
+                break;
+            }
+            cur = SafePtr(reader, cur);
+        }
     }
-    Console.WriteLine($"    nodeData resolved: {dataOk}/{tested3}   biome matches element +0x32E: {biomeMatch}/{dataOk}   mapId 'Map…' read: {mapIdOk}/{dataOk}  e.g. \"{exMap}\"");
-    if (dataOk < tested3 / 2) Console.WriteLine("    ⚠ nodeData chain (*(*(node+0x10)+0x20)) mostly null — POE2Radar already reads biome/mapId DIRECTLY off the element (+0x32E / +0x300 row), so this model may be unneeded.");
+    Console.WriteLine($"    nodeData {dataOk}/{tested3}; plausible status {statusOk}/{dataOk}; rolled map code {mapIdOk}/{dataOk}, e.g. \"{exMap}\"");
+    if (dataOk < tested3 / 2) Console.WriteLine("    ⚠ nodeData chain mostly null.");
 
     Console.WriteLine("\nSUMMARY");
     Console.WriteLine($"  grid coords : {(gridOff >= 0 ? $"+0x{gridOff:X3} ({gridSet.Count} positions)" : "NOT FOUND")}");
@@ -6429,30 +6331,25 @@ static int RunAtlasCurrent(ProcessHandle process, MemoryReader reader)
 {
     var (_, igs, ai, _) = ResolveChain(process, reader);
     if (igs == 0) { Console.Error.WriteLine("no chain (in game?)."); return 1; }
-    // AreaCode is TWO derefs: ai+AreaInfoPtr → AreaInfo; *AreaInfo → string ptr (matches Poe2Live.AreaCode).
     var areaInfo = SafePtr(reader, ai + Poe2.AreaInstance.AreaInfoPtr);
-    var areaCode = reader.ReadStringUtf16(SafePtr(reader, areaInfo), 64);
+    var areaCode = reader.ReadStringUtf16(SafePtr(reader, areaInfo + Poe2.AreaInfo.Code), 64);
     Console.WriteLine($"ATLAS CURRENT-NODE DISCOVERY\n============================\ncurrent area code = \"{areaCode}\"\n");
 
     var (vt, canvas, nodes) = FindAtlasNodeClass(reader, igs);
     if (vt == 0 || nodes.Count < 50) { Console.Error.WriteLine($"FAIL: node class not found ({nodes.Count}). Open the Atlas MAP view."); return 1; }
     Console.WriteLine($"node class 0x{vt:X}  canvas 0x{canvas:X}  ({nodes.Count} nodes)");
 
-    // Per-node: grid (+0x320) + raw map code via the data-model chain *(*(el+0x10)+0x20)+0x2A0.
-    string CodeOf(nint el)
-    {
-        var storage = SafePtr(reader, el + 0x10); if (storage == 0) return "";
-        var data = SafePtr(reader, storage + 0x20); if (data == 0) return "";
-        var wrap = SafePtr(reader, data + 0x2A0); if (wrap == 0) return "";
-        var hdr = SafePtr(reader, wrap); if (hdr == 0) return "";
-        var buf = SafePtr(reader, hdr); return buf == 0 ? "" : reader.ReadStringUtf16(buf, 64);
-    }
+    string CodeOf(nint el) => ReadAtlasRolledMapCode(reader, el);
     (int x, int y) GridOf(nint el)
-    { reader.TryReadStruct<int>(el + 0x320, out var gx); reader.TryReadStruct<int>(el + 0x324, out var gy); return (gx, gy); }
+    {
+        reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos, out var gx);
+        reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos + 4, out var gy);
+        return (gx, gy);
+    }
 
     // Identify the HOVERED node (cursor inverse-projected into canvas/relPos units), like the F10 inspector.
     var scales = new List<float>();
-    foreach (var el in nodes) if (reader.TryReadStruct<float>(el + 0x130, out var sc) && sc is > 0.01f and < 4f) scales.Add(sc);
+    foreach (var el in nodes) if (reader.TryReadStruct<float>(el + Poe2.UiElement.LocalScaleMul, out var sc) && sc is > 0.01f and < 4f) scales.Add(sc);
     scales.Sort(); float zoom = scales.Count > 0 ? scales[scales.Count / 2] : 0.85f;
     int winH = Win.GetSystemMetrics(1); if (winH <= 0) winH = 1080;
     float pscale = winH / 1600f * zoom; if (pscale < 1e-4f) pscale = 1f;
@@ -6461,8 +6358,8 @@ static int RunAtlasCurrent(ProcessHandle process, MemoryReader reader)
     nint hovered = 0; double bIn = 1e18, bAny = 1e18; nint hoverAny = 0;
     foreach (var el in nodes)
     {
-        if (!reader.TryReadStruct<float>(el + 0x118, out var rx) || !reader.TryReadStruct<float>(el + 0x11C, out var ry)) continue;
-        reader.TryReadStruct<float>(el + 0x288, out var w); reader.TryReadStruct<float>(el + 0x28C, out var h);
+        if (!reader.TryReadStruct<float>(el + Poe2.UiElement.RelativePos, out var rx) || !reader.TryReadStruct<float>(el + Poe2.UiElement.RelativePos + 4, out var ry)) continue;
+        reader.TryReadStruct<float>(el + Poe2.UiElement.SizeW, out var w); reader.TryReadStruct<float>(el + Poe2.UiElement.SizeH, out var h);
         double dx = curX - rx, dy = curY - ry, d = dx * dx + dy * dy;
         if (d < bAny) { bAny = d; hoverAny = el; }
         double hw = (w > 1 ? w : 40) * 0.5, hh = (h > 1 ? h : 40) * 0.5;
@@ -6540,7 +6437,7 @@ static int RunAtlasCurrent(ProcessHandle process, MemoryReader reader)
         nint hv2 = 0; double best = 1e18;
         foreach (var el in nodes)
         {
-            if (!reader.TryReadStruct<float>(el + 0x118, out var rx) || !reader.TryReadStruct<float>(el + 0x11C, out var ry)) continue;
+            if (!reader.TryReadStruct<float>(el + Poe2.UiElement.RelativePos, out var rx) || !reader.TryReadStruct<float>(el + Poe2.UiElement.RelativePos + 4, out var ry)) continue;
             double dx = hx - rx, dy = hy - ry, d = dx * dx + dy * dy;
             if (d < best) { best = d; hv2 = el; }
         }
@@ -6556,10 +6453,7 @@ static int RunAtlasCurrent(ProcessHandle process, MemoryReader reader)
     return 0;
 }
 
-// ── Characterise the CURRENT-LOCATION marker element: the (hypothesised unique) non-node UiElement whose
-//    +0x300 points at a node-class element. Confirms uniqueness + a STRUCTURAL accessor (no hardcoded
-//    vtable, which drifts per patch): "the element E with Ptr(E+0x300) ∈ node set". Dumps its node, vtable,
-//    position, and ancestry so we can wire the overlay to read currentNode = *(marker+0x300) each frame. ──
+// ── Characterise the current-location marker element using CurrentMarkerNodePtr. ──
 static int RunAtlasMarker(ProcessHandle process, MemoryReader reader)
 {
     var (_, igs, _, _) = ResolveChain(process, reader);
@@ -6567,44 +6461,51 @@ static int RunAtlasMarker(ProcessHandle process, MemoryReader reader)
     var (vt, canvas, nodes) = FindAtlasNodeClass(reader, igs);
     if (vt == 0 || nodes.Count < 50) { Console.Error.WriteLine($"FAIL: node class not found ({nodes.Count})."); return 1; }
     var nodeSet = new HashSet<nint>(nodes);
-    (int x, int y) GridOf(nint el) { reader.TryReadStruct<int>(el + 0x320, out var gx); reader.TryReadStruct<int>(el + 0x324, out var gy); return (gx, gy); }
-    string CodeOf(nint el)
-    { var st = SafePtr(reader, el + 0x10); if (st == 0) return ""; var d = SafePtr(reader, st + 0x20); if (d == 0) return ""; var w = SafePtr(reader, d + 0x2A0); if (w == 0) return ""; var h = SafePtr(reader, w); if (h == 0) return ""; var b = SafePtr(reader, h); return b == 0 ? "" : reader.ReadStringUtf16(b, 64); }
+    (int x, int y) GridOf(nint el)
+    {
+        reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos, out var gx);
+        reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos + 4, out var gy);
+        return (gx, gy);
+    }
+    string CodeOf(nint el) => ReadAtlasRolledMapCode(reader, el);
 
-    // BFS the whole UI tree; collect every element E (Self==self) whose +0x300 points at a node-class element.
+    // BFS the UI tree; collect non-node elements whose configured marker field targets a node.
     var uiRoot = SafePtr(reader, igs + Poe2.InGameState.UiRoot);
-    var root = SafePtr(reader, uiRoot + 0xB8) is var tr && tr != 0 ? tr : uiRoot;
+    var root = SafePtr(reader, uiRoot + Poe2.UiElement.Parent) is var tr && tr != 0 ? tr : uiRoot;
     var queue = new Queue<nint>(); queue.Enqueue(root);
     var visited = new HashSet<nint>();
     var markers = new List<nint>();
     while (queue.Count > 0 && visited.Count < 300000)
     {
         var el = queue.Dequeue();
-        if (el == 0 || !visited.Add(el) || SafePtr(reader, el + 0x08) != el) continue;
-        if (!nodeSet.Contains(el)) { var p300 = SafePtr(reader, el + 0x300); if (p300 != 0 && nodeSet.Contains(p300)) markers.Add(el); }
-        var first = SafePtr(reader, el + 0x10);
-        if (first != 0 && reader.TryReadStruct<nint>(el + 0x18, out var last))
-        { var n = ((long)last - (long)first) / 8; if (n is > 0 and <= 16384) for (long k = 0; k < n; k++) queue.Enqueue(SafePtr(reader, first + (nint)(k * 8))); }
+        if (el == 0 || !visited.Add(el) || SafePtr(reader, el + Poe2.UiElement.Self) != el) continue;
+        if (!nodeSet.Contains(el))
+        {
+            var node = SafePtr(reader, el + Poe2.AtlasGraph.CurrentMarkerNodePtr);
+            if (node != 0 && nodeSet.Contains(node)) markers.Add(el);
+        }
+        var first = SafePtr(reader, el + Poe2.UiElement.Children);
+        if (first != 0 && reader.TryReadStruct<nint>(el + Poe2.UiElement.ChildrenEnd, out var last))
+        {
+            var count = ((long)last - (long)first) / 8;
+            if (count is > 0 and <= 16384)
+                for (long i = 0; i < count; i++) queue.Enqueue(SafePtr(reader, first + (nint)(i * 8)));
+        }
     }
 
     Console.WriteLine($"ATLAS CURRENT-LOCATION MARKER\n=============================\nnodes {nodes.Count}  canvas 0x{canvas:X}");
-    Console.WriteLine($"non-node elements whose +0x300 → a node: {markers.Count}\n");
-    foreach (var m in markers)
+    Console.WriteLine($"non-node elements whose +0x{Poe2.AtlasGraph.CurrentMarkerNodePtr:X} → a node: {markers.Count}\n");
+    foreach (var marker in markers)
     {
-        var node = SafePtr(reader, m + 0x300);
-        reader.TryReadStruct<float>(m + 0x118, out var mrx); reader.TryReadStruct<float>(m + 0x11C, out var mry);
-        reader.TryReadStruct<uint>(m + 0x180, out var fl);
-        Console.WriteLine($"  marker 0x{m:X}  vt 0x{SafePtr(reader, m):X} (mod +0x{(long)SafePtr(reader, m) - (long)process.MainModuleBase:X})  relPos=({mrx:F0},{mry:F0})  visBit={((fl >> 0x0B) & 1)}");
-        Console.WriteLine($"      → current node 0x{node:X}  grid {GridOf(node)}  code \"{CodeOf(node)}\"");
-        // Ancestry: walk Parent (+0xB8) and show child indices, to find a stable path (canvas relation).
-        var chain = new List<nint>(); var cur = m; var g = 0;
-        while (cur != 0 && g++ < 12) { chain.Add(cur); var par = SafePtr(reader, cur + 0xB8); if (par == cur || par == 0) break; cur = par; }
-        Console.WriteLine($"      ancestry: {string.Join(" → ", chain.Select(a => $"0x{a:X}"))}");
-        Console.WriteLine($"      (canvas in ancestry: {chain.Contains(canvas)}; marker.parent==canvas.parent: {SafePtr(reader, m + 0xB8) == SafePtr(reader, canvas + 0xB8)})");
+        var node = SafePtr(reader, marker + Poe2.AtlasGraph.CurrentMarkerNodePtr);
+        reader.TryReadStruct<float>(marker + Poe2.UiElement.RelativePos, out var x);
+        reader.TryReadStruct<float>(marker + Poe2.UiElement.RelativePos + 4, out var y);
+        reader.TryReadStruct<uint>(marker + Poe2.UiElement.Flags, out var flags);
+        Console.WriteLine($"  marker 0x{marker:X} vt 0x{SafePtr(reader, marker):X} relPos=({x:F0},{y:F0}) visBit={((flags >> Poe2.UiElement.FlagVisibleBit) & 1)}");
+        Console.WriteLine($"      → current node 0x{node:X} grid {GridOf(node)} code \"{CodeOf(node)}\"");
     }
-    if (markers.Count == 0) Console.WriteLine("  (none right now — is the Atlas map view open with your player icon visible?)");
-    Console.WriteLine("\nIf exactly ONE marker and it points at your current map, currentNode = *(marker+0x300).");
-    Console.WriteLine("Accessor is structural (find the lone non-node element whose +0x300 ∈ node set) — vtable-independent.");
+    if (markers.Count == 0) Console.WriteLine("  (none right now — is the Atlas map view open?)");
+    Console.WriteLine($"\nExpected exactly one marker at +0x{Poe2.AtlasGraph.CurrentMarkerNodePtr:X}.");
     return 0;
 }
 
@@ -6620,10 +6521,13 @@ static int RunAtlasFindCur(ProcessHandle process, MemoryReader reader)
     if (vt == 0 || nodes.Count < 50) { Console.Error.WriteLine($"FAIL: node class not found ({nodes.Count}). Open the Atlas MAP view."); return 1; }
     var nodeSet = new HashSet<nint>(nodes);
 
-    string CodeOf(nint el)
-    { var st = SafePtr(reader, el + 0x10); if (st == 0) return ""; var d = SafePtr(reader, st + 0x20); if (d == 0) return ""; var w = SafePtr(reader, d + 0x2A0); if (w == 0) return ""; var h = SafePtr(reader, w); if (h == 0) return ""; var b = SafePtr(reader, h); return b == 0 ? "" : reader.ReadStringUtf16(b, 64); }
+    string CodeOf(nint el) => ReadAtlasRolledMapCode(reader, el);
     (int x, int y) GridOf(nint el)
-    { reader.TryReadStruct<int>(el + 0x320, out var gx); reader.TryReadStruct<int>(el + 0x324, out var gy); return (gx, gy); }
+    {
+        reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos, out var gx);
+        reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos + 4, out var gy);
+        return (gx, gy);
+    }
 
     // Capture the current node from the hover pointer (hover your player-icon tile while this starts).
     var target = SafePtr(reader, canvas + 0x420);
@@ -6677,336 +6581,293 @@ static int RunAtlasFindCur(ProcessHandle process, MemoryReader reader)
     return 0;
 }
 
-// ── Shared: locate the atlas-node class + canvas (scored on size≈40×40 + biome-spread + count). ──
+// ── Shared: locate the atlas-node class + canvas by distinct GridPos coordinates. ──
 static (nint vt, nint canvas, List<nint> nodes) FindAtlasNodeClass(MemoryReader reader, nint igs)
 {
-    var uiRoot = SafePtr(reader, igs + 0x2F0);
-    var root = SafePtr(reader, uiRoot + 0xB8) is var tr && tr != 0 ? tr : uiRoot;
+    var uiRoot = SafePtr(reader, igs + Poe2.InGameState.UiRoot);
+    var root = SafePtr(reader, uiRoot + Poe2.UiElement.Parent) is var tr && tr != 0 ? tr : uiRoot;
     var queue = new Queue<nint>(); queue.Enqueue(root);
     var visited = new HashSet<nint>();
     var byVtable = new Dictionary<nint, List<nint>>();
     while (queue.Count > 0 && visited.Count < 200000)
     {
         var el = queue.Dequeue();
-        if (el == 0 || !visited.Add(el) || SafePtr(reader, el + 0x08) != el) continue;
+        if (el == 0 || !visited.Add(el) || SafePtr(reader, el + Poe2.UiElement.Self) != el) continue;
         var vt = SafePtr(reader, el);
-        if (vt != 0) (byVtable.TryGetValue(vt, out var l) ? l : byVtable[vt] = new()).Add(el);
-        var first = SafePtr(reader, el + 0x10);
-        if (first != 0 && reader.TryReadStruct<nint>(el + 0x18, out var last))
-        { var n = ((long)last - (long)first) / 8; if (n is > 0 and <= 16384) for (long k = 0; k < n; k++) queue.Enqueue(SafePtr(reader, first + (nint)(k * 8))); }
+        if (vt != 0) (byVtable.TryGetValue(vt, out var list) ? list : byVtable[vt] = new()).Add(el);
+        var first = SafePtr(reader, el + Poe2.UiElement.Children);
+        if (first != 0 && reader.TryReadStruct<nint>(el + Poe2.UiElement.ChildrenEnd, out var last))
+        {
+            var count = ((long)last - (long)first) / 8;
+            if (count is > 0 and <= 16384)
+                for (long i = 0; i < count; i++) queue.Enqueue(SafePtr(reader, first + (nint)(i * 8)));
+        }
     }
-    var ranked = new List<(nint vt, int count, int biomes, float w)>();
+
+    nint nodeVt = 0;
+    var bestDistinct = 0;
     foreach (var (vt, list) in byVtable)
     {
         if (list.Count < 50) continue;
-        var biomes = new HashSet<int>(); var szs = new List<float>();
-        foreach (var el in list.Take(400))
-        { if (reader.TryReadStruct<byte>(el + 0x32E, out var b) && b is >= 1 and <= 12) biomes.Add(b); if (reader.TryReadStruct<float>(el + 0x288, out var sw)) szs.Add(sw); }
-        var modalW = szs.GroupBy(s => (int)s).OrderByDescending(g => g.Count()).FirstOrDefault()?.Key ?? 0;
-        ranked.Add((vt, list.Count, biomes.Count, modalW));
-    }
-    var pick = ranked.Where(r => r.w is >= 28 and <= 56 && r.biomes >= 3).OrderByDescending(r => r.count).FirstOrDefault();
-    if (pick.vt == 0) pick = ranked.OrderByDescending(r => r.biomes).ThenByDescending(r => r.count).FirstOrDefault();
-    if (pick.vt == 0) return (0, 0, new List<nint>());
-    var nodes = byVtable[pick.vt];
-    var parentCount = new Dictionary<nint, int>();
-    foreach (var el in nodes) { var p = SafePtr(reader, el + 0xB8); if (p != 0) parentCount[p] = parentCount.GetValueOrDefault(p) + 1; }
-    var canvas = parentCount.Count == 0 ? 0 : parentCount.OrderByDescending(k => k.Value).First().Key;
-    return (pick.vt, canvas, nodes);
-}
-
-// Sniff name/path strings reachable from a UI element: scan its first 0xC0 bytes for canonical pointers,
-// deref each, and try reading a string there (UTF-16 and ASCII) + at common 1-hop offsets (*(p), *(p+0x20)).
-// Content/icon defs carry a path or name string near their start → names the modifier directly.
-static List<string> SniffPointerStrings(MemoryReader reader, nint baseAddr, int span = 0xC0, int cap = 6)
-{
-    var outp = new List<string>(); var seen = new HashSet<long>();
-    var buf = new byte[span];
-    if (reader.TryReadBytes(baseAddr, buf) < buf.Length) return outp;
-    string AsciiAt(nint a)
-    {
-        var b = new byte[64]; if (reader.TryReadBytes(a, b) <= 0) return "";
-        var sb = new System.Text.StringBuilder(); foreach (var ch in b) { if (ch >= 0x20 && ch < 0x7f) sb.Append((char)ch); else break; }
-        return sb.ToString();
-    }
-    for (var off = 0; off + 8 <= buf.Length && outp.Count < cap; off += 8)
-    {
-        var p = (nint)BitConverter.ToInt64(buf, off);
-        if ((ulong)p < 0x10000 || (ulong)p > 0x7FFFFFFFFFFF || !seen.Add((long)p)) continue;
-        foreach (var cand in new[] { p, SafePtr(reader, p), SafePtr(reader, p + 0x20), SafePtr(reader, p + 0x8) })
+        var coords = new HashSet<(int, int)>();
+        var inRange = 0;
+        foreach (var el in list)
         {
-            if (cand == 0) continue;
-            var w = reader.ReadStringUtf16(cand, 64); var a = AsciiAt(cand);
-            var s = Printable(w) && w.Length >= 4 ? w : (Printable(a) && a.Length >= 4 ? a : null);
-            if (s != null) { outp.Add($"+0x{off:X2}→\"{s}\""); break; }
+            if (!reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos, out var gx) ||
+                !reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos + 4, out var gy) ||
+                gx is < -64 or > 64 || gy is < 0 or > 192) continue;
+            inRange++;
+            coords.Add((gx, gy));
         }
+        if (inRange < list.Count * 0.5 || coords.Count < 20 || coords.Count <= bestDistinct) continue;
+        bestDistinct = coords.Count;
+        nodeVt = vt;
     }
-    return outp;
+    if (nodeVt == 0) return (0, 0, new List<nint>());
+    var nodes = byVtable[nodeVt];
+    var parents = new Dictionary<nint, int>();
+    foreach (var el in nodes)
+    {
+        var parent = SafePtr(reader, el + Poe2.UiElement.Parent);
+        if (parent != 0) parents[parent] = parents.GetValueOrDefault(parent) + 1;
+    }
+    var canvas = parents.Count == 0 ? 0 : parents.OrderByDescending(p => p.Value).First().Key;
+    return (nodeVt, canvas, nodes);
 }
 
-// ── Atlas RESOLVE: exhaustively try to turn a node's ContentVec ids → modifier NAMES ─────────────
-// For the node under the cursor, tries every route: ContentVec ids as arena offsets (several base
-// candidates derived from the node's dat pointers + the known 0x40180000000 arena), pointer
-// reconstruction, and deep-sniffing the tag-icon children for icon-path/name strings. Hover a node
-// whose mechanic you KNOW, run this, and see which route prints that name → that's our mapping route.
+
+static string ReadAtlasRolledMapCode(MemoryReader reader, nint element)
+{
+    var storage = SafePtr(reader, element + Poe2.AtlasNode.DataStorage);
+    if (storage == 0) return "";
+    var data = SafePtr(reader, storage + Poe2.AtlasNode.DataModel);
+    if (data == 0) return "";
+    var cur = data + Poe2.AtlasNode.DataMapId;
+    for (var hop = 0; hop < 4 && cur != 0; hop++)
+    {
+        var code = reader.ReadStringUtf16(cur, 64);
+        if (code.StartsWith("Map", StringComparison.Ordinal)) return code;
+        cur = SafePtr(reader, cur);
+    }
+    return "";
+}
+
+// ── Atlas resolver: report the rolled map identity and current node fields under the cursor ─────
 static int RunAtlasResolve(ProcessHandle process, MemoryReader reader)
 {
     var (_, igs, _, _) = ResolveChain(process, reader);
     if (igs == 0) { Console.Error.WriteLine("no chain."); return 1; }
-    var (vt, canvas, all) = FindAtlasNodeClass(reader, igs);
-    if (vt == 0) { Console.Error.WriteLine("FAIL: no node class (open the Atlas MAP view)."); return 1; }
-    // Canvas children = the drawn set (carries name + ContentVec).
-    var nodes = new List<nint>();
-    var cf = SafePtr(reader, canvas + 0x10); reader.TryReadStruct<nint>(canvas + 0x18, out var cl);
-    var cc = (cf != 0 && (long)cl > (long)cf) ? ((long)cl - (long)cf) / 8 : 0;
-    for (long i = 0; i < cc && i < 20000; i++) { var ch = SafePtr(reader, cf + (nint)(i * 8)); if (ch != 0 && SafePtr(reader, ch) == vt) nodes.Add(ch); }
-    if (nodes.Count < 8) nodes = all;
-    // LAYER SURVEY: group ALL node instances by parent canvas; report which canvas holds the
-    // content-bearing nodes (+0x310 atlas-row populated, non-empty ContentVec). Resolves the
-    // "display layer vs data layer" ambiguity definitively.
-    Console.WriteLine("LAYER SURVEY (parent canvas → children / with +0x310 / with content):");
-    var byParent = new Dictionary<nint, List<nint>>();
-    foreach (var n in all) { var p = SafePtr(reader, n + 0xB8); if (p != 0) (byParent.TryGetValue(p, out var l) ? l : byParent[p] = new()).Add(n); }
-    foreach (var (p, list) in byParent.OrderByDescending(k => k.Value.Count).Take(6))
-    {
-        int withRow = 0, withContent = 0;
-        foreach (var n in list)
-        {
-            if (SafePtr(reader, n + 0x310) != 0) withRow++;
-            var b = SafePtr(reader, n + 0x350); reader.TryReadStruct<nint>(n + 0x358, out var e);
-            if (b != 0 && (long)e > (long)b) withContent++;
-        }
-        var lo = list.Min(x => (long)x); var hi = list.Max(x => (long)x);
-        Console.WriteLine($"  canvas 0x{p:X}: {list.Count} kids, {withRow} with +0x310 row, {withContent} with ContentVec  (addr 0x{lo:X}..0x{hi:X})");
-    }
-    Console.WriteLine();
-    if (!Win.GetCursorPos(out var cur)) { Console.Error.WriteLine("no cursor."); return 1; }
+    var (vtable, _, nodes) = FindAtlasNodeClass(reader, igs);
+    if (vtable == 0 || nodes.Count == 0) { Console.Error.WriteLine("no atlas-node class found (open the Atlas map view)."); return 1; }
+    if (!Win.GetCursorPos(out var cursor)) { Console.Error.WriteLine("no cursor."); return 1; }
+
     int winH = Win.GetSystemMetrics(1); if (winH <= 0) winH = 1080;
-    float uiscale = winH / 1600f;
-    var scales = nodes.Select(n => { reader.TryReadStruct<float>(n + 0x130, out var s); return s; }).Where(s => s > 0.01f).OrderBy(s => s).ToList();
-    float zoom = scales.Count > 0 ? scales[scales.Count / 2] : 0.85f;
-    float factor = uiscale * zoom, off = factor * 20f;
-    // Pick the nearest DATA node (+0x310 populated) — the empty display twins are skipped. Fall back to
-    // nearest-overall only if no data node is within reach.
-    nint el = 0, elAny = 0; double bd = 1e18, bdAny = 1e18;
-    foreach (var n in nodes)
+    reader.TryReadStruct<float>(nodes[0] + Poe2.UiElement.LocalScaleMul, out var zoom);
+    if (zoom < 0.01f) zoom = 0.85f;
+    var factor = winH / 1600f * zoom;
+    var offset = factor * 20f;
+    nint nearest = 0;
+    var best = double.MaxValue;
+    foreach (var node in nodes)
     {
-        reader.TryReadStruct<float>(n + 0x118, out var rx); reader.TryReadStruct<float>(n + 0x11C, out var ry);
-        double d = (factor * rx + off - cur.X) * (factor * rx + off - cur.X) + (factor * ry + off - cur.Y) * (factor * ry + off - cur.Y);
-        if (d < bdAny) { bdAny = d; elAny = n; }
-        if (SafePtr(reader, n + 0x310) != 0 && d < bd) { bd = d; el = n; }
+        reader.TryReadStruct<float>(node + Poe2.UiElement.RelativePos, out var x);
+        reader.TryReadStruct<float>(node + Poe2.UiElement.RelativePos + 4, out var y);
+        var d = Math.Pow(factor * x + offset - cursor.X, 2) + Math.Pow(factor * y + offset - cursor.Y, 2);
+        if (d < best) { best = d; nearest = node; }
     }
-    if (el == 0 || bd > 400.0 * 400.0) { el = elAny; bd = bdAny; }
-    if (el == 0) { Console.Error.WriteLine("no node near cursor."); return 1; }
-    Console.WriteLine($"cursor ({cur.X},{cur.Y})  zoom {zoom:F3}  pickDist(data node) {Math.Sqrt(bd):F0}px");
-
-    string? TryStr(nint a) { if ((ulong)a < 0x10000 || (ulong)a > 0x7FFFFFFFFFFF) return null; var w = reader.ReadStringUtf16(a, 64); if (Printable(w) && w.Length >= 3) return w; var b = new byte[80]; if (reader.TryReadBytes(a, b) > 0) { var sb = new System.Text.StringBuilder(); foreach (var ch in b) { if (ch >= 0x20 && ch < 0x7f) sb.Append((char)ch); else break; } if (sb.Length >= 3) return sb.ToString(); } return null; }
-    // Resolve a candidate address through a few hops, returning the first readable string.
-    string? Deref(nint a) { foreach (var c in new[] { a, SafePtr(reader, a), SafePtr(reader, a + 0x20), SafePtr(reader, a + 0x8), SafePtr(reader, a + 0x10) }) { var s = TryStr(c); if (s != null) return s; } return null; }
-
-    var p300 = SafePtr(reader, el + 0x300); var p308 = SafePtr(reader, el + 0x308); var p318 = SafePtr(reader, el + 0x318);
-    Console.WriteLine($"RESOLVE node 0x{el:X}  dat ptrs: +0x300=0x{p300:X} +0x308=0x{p308:X} +0x318=0x{p318:X}");
-    Console.WriteLine($"  +0x300 → \"{Deref(p300)}\"   +0x318 → \"{Deref(p318)}\"");
-    var vb = SafePtr(reader, el + 0x350); reader.TryReadStruct<nint>(el + 0x358, out var ve);
-    var vlen = (vb != 0 && (long)ve > (long)vb) ? (int)((long)ve - (long)vb) : 0;
-    var ids = new List<uint>(); for (var i = 0; i < vlen / 4 && i < 16; i++) { reader.TryReadStruct<uint>(vb + (nint)(i * 4), out var x); ids.Add(x); }
-    Console.WriteLine($"  ContentVec ({vlen}B): {string.Join(", ", ids.Select(x => $"{x} (0x{x:X})"))}\n");
-
-    // Base candidates for the "id is an offset into a data arena" hypothesis.
-    long[] bases =
-    {
-        (long)p300 & ~0xFFFFFFFFL, (long)p308 & ~0xFFFFFFFFL, (long)p318 & ~0xFFFFFFFFL,
-        (long)p300 & ~0xFFFFFFFFFFL, 0x40180000000L,
-        (long)el & ~0xFFFFFFFFL,
-    };
-    var p310 = SafePtr(reader, el + 0x310);
-    long[] dumpBases = { (long)p300 & ~0xFFFFFFFFL, (long)p310 & ~0xFFFFFFFFL, (long)p318 & ~0xFFFFFFFFL, 0x40180000000L };
-    Console.WriteLine("[Route A] id as offset into an arena — RAW DUMP + sniff at base+id (non-base ids):");
-    foreach (var id in ids.Where(x => x != 4220400))
-        foreach (var b in dumpBases.Distinct())
-        {
-            var cand = (nint)(b + id);
-            var raw = new byte[0x40];
-            if (reader.TryReadBytes(cand, raw) < 0x40) continue; // unmapped → wrong base
-            var q = new List<string>(); for (var k = 0; k < 4; k++) q.Add($"0x{BitConverter.ToInt64(raw, k * 8):X}");
-            var strs = SniffPointerStrings(reader, cand, 0x80, 8);
-            Console.WriteLine($"  id 0x{id:X} @ base 0x{b:X} (=0x{cand:X}): [{string.Join(" ", q)}]");
-            if (strs.Count > 0) Console.WriteLine($"        strs: {string.Join("  ", strs)}");
-        }
-
-    // [Route B] tag-icon children deep sniff (icon path / def name).
-    Console.WriteLine("\n[Route B] tag-icon children — chase +0x300/+0x310 ptrs + deep sniff (incl. grandchildren):");
-    void DumpKid(nint ch, string lbl)
-    {
-        var k300 = SafePtr(reader, ch + 0x300); var k310 = SafePtr(reader, ch + 0x310);
-        var s300 = Deref(k300); var s310 = Deref(k310);
-        if (s300 != null || s310 != null) Console.WriteLine($"  {lbl} 0x{ch:X}: +0x300→\"{s300}\"  +0x310→\"{s310}\"");
-        foreach (var s in SniffPointerStrings(reader, ch, 0x360, 16)) Console.WriteLine($"  {lbl} 0x{ch:X} sniff: {s}");
-    }
-    var kf = SafePtr(reader, el + 0x10); reader.TryReadStruct<nint>(el + 0x18, out var kl);
-    var kn = (kf != 0 && (long)kl > (long)kf) ? ((long)kl - (long)kf) / 8 : 0;
-    for (long i = 0; i < kn && i < 12; i++)
-    {
-        var ch = SafePtr(reader, kf + (nint)(i * 8)); if (ch == 0) continue;
-        DumpKid(ch, $"child[{i}]");
-        var gf = SafePtr(reader, ch + 0x10); reader.TryReadStruct<nint>(ch + 0x18, out var gl);
-        var gn = (gf != 0 && (long)gl > (long)gf) ? ((long)gl - (long)gf) / 8 : 0;
-        for (long j = 0; j < gn && j < 6; j++) { var gc = SafePtr(reader, gf + (nint)(j * 8)); if (gc != 0) DumpKid(gc, $"  gchild[{i}.{j}]"); }
-    }
-
-    // [Route C] deep-sniff the node itself (the NAME may sit near the description).
-    Console.WriteLine("\n[Route C] node deep-sniff (0..0x400) — name should be near the description:");
-    foreach (var s in SniffPointerStrings(reader, el, 0x400, 30)) Console.WriteLine($"  {s}");
-
-    // [Route D] The per-node EndgameMapAtlas.dat ROW (+0x310 target). Dump it and chase every pointer it
-    // holds 2 levels deep for strings — the rolled content may be pointers to content rows (codes/names).
-    Console.WriteLine($"\n[Route D] per-node EndgameMapAtlas row @ +0x310 = 0x{p310:X} — raw + pointer chase:");
-    if (p310 != 0)
-    {
-        var row = new byte[0x100];
-        if (reader.TryReadBytes(p310, row) >= 0x100)
-        {
-            for (var o = 0; o + 8 <= 0x100; o += 8)
-            {
-                var pp = (nint)BitConverter.ToInt64(row, o);
-                if ((ulong)pp < 0x10000 || (ulong)pp > 0x7FFFFFFFFFFF) continue;
-                var s = Deref(pp);
-                var strs2 = SniffPointerStrings(reader, pp, 0xA0, 6);
-                if (s != null || strs2.Count > 0) Console.WriteLine($"  +0x{o:X2}→0x{pp:X}  direct:\"{s}\"  sniff:{string.Join(",", strs2)}");
-            }
-        }
-        else Console.WriteLine("  (row not fully readable)");
-    }
-    // [Route E] The EndgameMaps (map-TYPE) row at node +0x300 — dump it WIDE to locate the map NAME
-    // ("Vaal Ruins", "Precursor Tower", …) which sits near the description. For map-type/name tags.
-    Console.WriteLine($"\n[Route E] EndgameMaps row @ node+0x300 = 0x{p300:X} — wide string scan for the map NAME:");
-    for (var eoff = -0x40; eoff < 0x140; eoff += 8)
-    {
-        var pp = SafePtr(reader, (nint)((long)p300 + eoff));
-        if (pp == 0) continue;
-        var s = TryStr(pp); if (s == null) { var d2 = SafePtr(reader, pp); s = d2 == 0 ? null : TryStr(d2); }
-        if (s != null) Console.WriteLine($"  +0x{eoff:X} → \"{s}\"");
-    }
-    Console.WriteLine("\nDONE. Whichever route printed your hovered node's known mechanic name is the mapping route.");
+    if (nearest == 0) { Console.Error.WriteLine("no node near cursor."); return 1; }
+    reader.TryReadStruct<int>(nearest + Poe2.AtlasNode.GridPos, out var gx);
+    reader.TryReadStruct<int>(nearest + Poe2.AtlasNode.GridPos + 4, out var gy);
+    reader.TryReadStruct<byte>(nearest + Poe2.AtlasNode.State, out var state);
+    reader.TryReadStruct<byte>(nearest + Poe2.AtlasNode.MapRowIndex, out var row);
+    reader.TryReadStruct<byte>(nearest + Poe2.AtlasNode.Biome, out var biome);
+    reader.TryReadStruct<byte>(nearest + Poe2.AtlasNode.Flags, out var flags);
+    reader.TryReadStruct<byte>(nearest + Poe2.AtlasNode.Completion, out var completion);
+    var atlas = new POE2Radar.Core.Game.Poe2Atlas(reader);
+    var vector = atlas.ReadContentVector(nearest);
+    var ids = atlas.ReadContentIds(nearest);
+    var names = ids.Select(id => AtlasMapData.Shared.TryGetContent(id, out var meta) ? meta.Name : $"#{id}");
+    Console.WriteLine($"node 0x{nearest:X}, distance {Math.Sqrt(best):F0}px, grid=({gx},{gy}), rolledMap=\"{ReadAtlasRolledMapCode(reader, nearest)}\"");
+    Console.WriteLine($"fields: state=0x{state:X2} mapRowIndex={row} biome={biome} flags=0x{flags:X2} completion={completion}");
+    Console.WriteLine($"contentVec=({vector.Begin:X},{vector.End:X},{vector.Capacity:X}) count={vector.Count} valid={vector.Valid} ids=[{string.Join(", ", ids)}] names=[{string.Join(", ", names)}]");
     return 0;
 }
 
-// ── Atlas CONTENT dump: find WHERE per-node modifiers live (Breach/Ritual/boss/etc.) ─────────────
-// IconType (a content int found by walking child icon elements) shows ONE tag; maps carry many. This
-// surveys every candidate carrier per node — the +0x310 content u32, the +0x350/+0x358 ContentVec, and
-// the child TAG elements (each child's +0x300/+0x310 + size) — and histograms the content-type ids on
-// the current atlas. Run it, then hover a node whose modifier you KNOW (read the tooltip) and re-run:
-// the "NODE UNDER CURSOR" dump correlates that id → name. Build the id→name table from those examples.
+// ── Atlas CONTENT dump: validate the current per-node byte vector and numeric name mapping ───────
+// Each sampled node reports the three vector pointers, guarded count, raw byte ids, and names known
+// by atlas_content.json. No scalar content field or child-element heuristic is inspected.
 static int RunAtlasContent(ProcessHandle process, MemoryReader reader)
 {
     var (_, igs, _, _) = ResolveChain(process, reader);
     if (igs == 0) { Console.Error.WriteLine("no chain."); return 1; }
-    var (vt, canvas, nodes) = FindAtlasNodeClass(reader, igs);
-    if (vt == 0) { Console.Error.WriteLine("FAIL: no node class (open the Atlas MAP view)."); return 1; }
-    Console.WriteLine($"ATLAS CONTENT DUMP — node class 0x{vt:X}, {nodes.Count} instances, canvas 0x{canvas:X}");
-    // Use the CANVAS CHILDREN (the set the overlay actually draws) — not every vtable instance, which
-    // also includes non-displayed twins (e.g. a hover-highlight layer) that carry no content.
-    if (canvas != 0)
-    {
-        var cf0 = SafePtr(reader, canvas + 0x10); reader.TryReadStruct<nint>(canvas + 0x18, out var cl0);
-        var cc0 = (cf0 != 0 && (long)cl0 > (long)cf0) ? ((long)cl0 - (long)cf0) / 8 : 0;
-        var kids = new List<nint>();
-        for (long i = 0; i < cc0 && i < 20000; i++) { var ch = SafePtr(reader, cf0 + (nint)(i * 8)); if (ch != 0 && SafePtr(reader, ch) == vt) kids.Add(ch); }
-        if (kids.Count >= 8) { nodes = kids; Console.WriteLine($"using {kids.Count} CANVAS CHILDREN (the drawn set)"); }
-    }
-    Console.WriteLine();
+    var (vtable, canvas, nodes) = FindAtlasNodeClass(reader, igs);
+    if (vtable == 0) { Console.Error.WriteLine("no atlas-node class found (open the Atlas map view)."); return 1; }
 
-    // [A] +0x310 content u32 histogram across ALL nodes (the per-node 'content' field).
-    var c310 = new Dictionary<uint, int>();
-    var vecLens = new Dictionary<long, int>();
-    foreach (var n in nodes)
+    var atlas = new POE2Radar.Core.Game.Poe2Atlas(reader);
+    Console.WriteLine($"node class 0x{vtable:X}, {nodes.Count} instances, canvas 0x{canvas:X}");
+    Console.WriteLine($"ContentIds vector: begin +0x{Poe2.AtlasNode.ContentIdsBegin:X}, end +0x{Poe2.AtlasNode.ContentIdsEnd:X}, capacity +0x{Poe2.AtlasNode.ContentIdsCapacity:X}");
+    Console.WriteLine($"Names: checked-in numeric atlas_content.json snapshot; VisualIdentity row/icon remains unresolved.");
+    foreach (var el in nodes.Take(48))
     {
-        if (reader.TryReadStruct<uint>(n + 0x310, out var c)) c310[c] = c310.GetValueOrDefault(c) + 1;
-        var b = SafePtr(reader, n + 0x350); reader.TryReadStruct<nint>(n + 0x358, out var e);
-        var len = (b != 0 && e != 0 && (long)e > (long)b) ? ((long)e - (long)b) : 0;
-        vecLens[len] = vecLens.GetValueOrDefault(len) + 1;
+        reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos, out var gx);
+        reader.TryReadStruct<int>(el + Poe2.AtlasNode.GridPos + 4, out var gy);
+        reader.TryReadStruct<byte>(el + Poe2.AtlasNode.Biome, out var biome);
+        var vector = atlas.ReadContentVector(el);
+        var ids = atlas.ReadContentIds(el);
+        var names = ids.Select(id => AtlasMapData.Shared.TryGetContent(id, out var meta) ? meta.Name : $"#{id}");
+        Console.WriteLine($"  0x{el:X} grid=({gx},{gy}) biome={biome} vec=({vector.Begin:X},{vector.End:X},{vector.Capacity:X}) " +
+            $"count={vector.Count} valid={vector.Valid} ids=[{string.Join(", ", ids)}] names=[{string.Join(", ", names)}]");
     }
-    Console.WriteLine("[A] +0x310 content u32 histogram (value: #nodes):");
-    foreach (var kv in c310.OrderByDescending(k => k.Value).Take(20)) Console.WriteLine($"      {kv.Key,6} : {kv.Value}");
-    Console.WriteLine("\n[B] +0x350 ContentVec byte-length histogram (len: #nodes) — len/4 and len/8 hint element stride:");
-    foreach (var kv in vecLens.OrderBy(k => k.Key).Take(20)) Console.WriteLine($"      {kv.Key,6} bytes : {kv.Value} nodes  (/4={kv.Key / 4}, /8={kv.Key / 8})");
+    return 0;
+}
 
-    // [C] Detailed dump of nodes that carry content (cap 20): base fields + ContentVec raw + tag children.
-    Console.WriteLine("\n[C] CONTENT-BEARING NODES (base + ContentVec + tag children), up to 20:");
-    var shown = 0;
-    foreach (var n in nodes)
+// ── Atlas DataBiome validation: compare the confirmed deep mirror with direct Biome ───────────────
+// DataBiome is a shipping offset now, but this command remains a regression diagnostic.
+static int RunAtlasDataBiome(ProcessHandle process, MemoryReader reader)
+{
+    var (_, igs, _, _) = ResolveChain(process, reader);
+    if (igs == 0) { Console.Error.WriteLine("no chain."); return 1; }
+    var (vtable, canvas, nodes) = FindAtlasNodeClass(reader, igs);
+    if (vtable == 0 || nodes.Count == 0)
     {
-        reader.TryReadStruct<uint>(n + 0x310, out var content);
-        var vb = SafePtr(reader, n + 0x350); reader.TryReadStruct<nint>(n + 0x358, out var ve);
-        var vlen = (vb != 0 && ve != 0 && (long)ve > (long)vb) ? ((long)ve - (long)vb) : 0;
-        if (content == 0 && vlen == 0) continue;
-        if (shown++ >= 20) break;
-        reader.TryReadStruct<uint>(n + 0x300, out var id); reader.TryReadStruct<byte>(n + 0x32E, out var biome);
-        reader.TryReadStruct<byte>(n + 0x32F, out var fl); reader.TryReadStruct<byte>(n + 0x339, out var comp);
-        Console.WriteLine($"  node 0x{n:X} id={id} biome={biome} flags=0x{fl:X2} compl={comp} content(+0x310)={content} vec={vlen}B");
-        // ContentVec raw: dump up to 8 entries as both u32 and u64 so we can tell ids from pointers.
-        if (vlen is > 0 and <= 4096)
-        {
-            var cnt = (int)Math.Min(8, vlen / 4);
-            var u32 = new List<string>(); for (var i = 0; i < cnt; i++) { reader.TryReadStruct<uint>(vb + (nint)(i * 4), out var u); u32.Add(u.ToString()); }
-            Console.WriteLine($"      vec u32[]: {string.Join(", ", u32)}");
-        }
-        // Tag children: each child element's content ids + size (the drawn tag icons live here).
-        var cf = SafePtr(reader, n + 0x10); reader.TryReadStruct<nint>(n + 0x18, out var cl);
-        var ccount = (cf != 0 && (long)cl > (long)cf) ? ((long)cl - (long)cf) / 8 : 0;
-        for (long i = 0; i < ccount && i < 12; i++)
-        {
-            var ch = SafePtr(reader, cf + (nint)(i * 8)); if (ch == 0) continue;
-            reader.TryReadStruct<uint>(ch + 0x300, out var ci300); reader.TryReadStruct<uint>(ch + 0x310, out var ci310);
-            reader.TryReadStruct<float>(ch + 0x288, out var cw); reader.TryReadStruct<float>(ch + 0x28C, out var chh);
-            reader.TryReadStruct<float>(ch + 0x118, out var crx); reader.TryReadStruct<float>(ch + 0x11C, out var cry);
-            if (ci300 != 0 || ci310 != 0)
-                Console.WriteLine($"      child[{i}] 0x{ch:X} +0x300={ci300} +0x310={ci310} size={cw:F0}x{chh:F0} relPos=({crx:F0},{cry:F0})");
-        }
+        Console.Error.WriteLine("no atlas-node class found (open the Atlas map view).");
+        return 1;
     }
 
-    // [D] ALL node-class elements near the cursor (overlapping layers: the tile + its tag icons may be
-    //     separate elements). For each: base fields + ContentVec + sniffed name strings (deref pointers),
-    //     and the same for its children. The tag elements' icon/content def usually carries a NAME/path.
-    if (Win.GetCursorPos(out var cur))
+    const int scanStart = 0x280;
+    const int scanEnd = 0x2D0;
+    const int knownDataBiomeOffset = 0x2BE;
+    const int knownBiomeMax = 12;
+    var span = scanEnd - scanStart + 1;
+    var reads = new int[span];
+    var matches = new int[span];
+    var mismatches = new int[span];
+    var nonZeroMatches = new int[span];
+    var directValues = Enumerable.Range(0, span).Select(_ => new HashSet<byte>()).ToArray();
+    var candidateValues = Enumerable.Range(0, span).Select(_ => new HashSet<byte>()).ToArray();
+    var examples = Enumerable.Range(0, span).Select(_ => new List<(nint Node, byte Direct, byte Candidate)>()).ToArray();
+    var authoritativeBiomes = new HashSet<byte>();
+    var directReadable = 0;
+    var directUnreadable = 0;
+    var directOutOfRange = 0;
+    var unresolvedStorage = 0;
+    var unresolvedNodeData = 0;
+    var unresolvedDataStatus = 0;
+    var usable = 0;
+
+    foreach (var node in nodes)
     {
-        int winH = Win.GetSystemMetrics(1); if (winH <= 0) winH = 1080;
-        float uiscale = winH / 1600f;
-        reader.TryReadStruct<float>(nodes[0] + 0x130, out var zoom); if (zoom < 0.01f) zoom = 0.85f;
-        float factor = uiscale * zoom, off = factor * 20f;
-        var near = new List<(double d, nint el, float rx, float ry)>();
-        foreach (var n in nodes)
+
+        if (!reader.TryReadStruct<byte>(node + Poe2.AtlasNode.Biome, out var directBiome))
         {
-            reader.TryReadStruct<float>(n + 0x118, out var rx); reader.TryReadStruct<float>(n + 0x11C, out var ry);
-            double sx = factor * rx + off, sy = factor * ry + off, d = Math.Sqrt((sx - cur.X) * (sx - cur.X) + (sy - cur.Y) * (sy - cur.Y));
-            if (d <= 80) near.Add((d, n, rx, ry));
+            directUnreadable++;
+            continue;
         }
-        near.Sort((a, b) => a.d.CompareTo(b.d));
-        Console.WriteLine($"\n[D] {near.Count} node(s) within 80px of cursor ({cur.X},{cur.Y}) — closest first:");
-        foreach (var (d, el, rx, ry) in near.Take(8))
+        if (directBiome > knownBiomeMax)
         {
-            reader.TryReadStruct<uint>(el + 0x300, out var id32); reader.TryReadStruct<byte>(el + 0x32E, out var biome);
-            reader.TryReadStruct<byte>(el + 0x32F, out var fl); reader.TryReadStruct<byte>(el + 0x339, out var comp);
-            reader.TryReadStruct<float>(el + 0x288, out var sw); reader.TryReadStruct<float>(el + 0x28C, out var sh);
-            Console.WriteLine($"  ── el 0x{el:X} dist {d:F0}px id={id32} biome={biome} flags=0x{fl:X2} compl={comp} size={sw:F0}x{sh:F0} relPos=({rx:F0},{ry:F0})");
-            var vb = SafePtr(reader, el + 0x350); reader.TryReadStruct<nint>(el + 0x358, out var ve);
-            var vlen = (vb != 0 && (long)ve > (long)vb) ? ((long)ve - (long)vb) : 0;
-            if (vlen is > 0 and <= 4096) { var cnt = (int)Math.Min(16, vlen / 4); var u = new List<string>(); for (var i = 0; i < cnt; i++) { reader.TryReadStruct<uint>(vb + (nint)(i * 4), out var x); u.Add(x.ToString()); } Console.WriteLine($"       ContentVec({vlen}B): {string.Join(", ", u)}"); }
-            // DEEP sniff of the closest element only (full struct 0..0x360) — find the "Deserted" name +
-            // the link to the content layer. Shallow sniff for the rest.
-            foreach (var s in SniffPointerStrings(reader, el, d < 6 ? 0x360 : 0xC0, d < 6 ? 24 : 6)) Console.WriteLine($"       self {s}");
-            var cf = SafePtr(reader, el + 0x10); reader.TryReadStruct<nint>(el + 0x18, out var cl);
-            var ccount = (cf != 0 && (long)cl > (long)cf) ? ((long)cl - (long)cf) / 8 : 0;
-            for (long i = 0; i < ccount && i < 10; i++)
+            directOutOfRange++;
+            continue;
+        }
+        directReadable++;
+        var storage = SafePtr(reader, node + Poe2.AtlasNode.DataStorage);
+        if (storage == 0) { unresolvedStorage++; continue; }
+        var nodeData = SafePtr(reader, storage + Poe2.AtlasNode.DataModel);
+        if (nodeData == 0) { unresolvedNodeData++; continue; }
+        if (!reader.TryReadStruct<byte>(nodeData + Poe2.AtlasNode.DataStatus, out _))
+        {
+            unresolvedDataStatus++;
+            continue;
+        }
+
+        usable++;
+        authoritativeBiomes.Add(directBiome);
+        for (var i = 0; i < span; i++)
+        {
+            var offset = scanStart + i;
+            if (!reader.TryReadStruct<byte>(nodeData + offset, out var candidate)) continue;
+            reads[i]++;
+            directValues[i].Add(directBiome);
+            candidateValues[i].Add(candidate);
+            if (candidate == directBiome)
             {
-                var ch = SafePtr(reader, cf + (nint)(i * 8)); if (ch == 0) continue;
-                reader.TryReadStruct<float>(ch + 0x288, out var cw); reader.TryReadStruct<float>(ch + 0x118, out var crx); reader.TryReadStruct<float>(ch + 0x11C, out var cry);
-                var strs = SniffPointerStrings(reader, ch);
-                if (strs.Count > 0) Console.WriteLine($"       child[{i}] 0x{ch:X} w={cw:F0} relPos=({crx:F0},{cry:F0}): {string.Join("  ", strs)}");
+                matches[i]++;
+                if (candidate != 0) nonZeroMatches[i]++;
+            }
+            else
+            {
+                mismatches[i]++;
+                if (examples[i].Count < 4) examples[i].Add((node, directBiome, candidate));
             }
         }
     }
-    Console.WriteLine("\nDONE. Re-run while hovering distinct known-modifier tiles to map content ids/strings → names.");
+
+    Console.WriteLine("Atlas DataBiome validation");
+    Console.WriteLine("=========================");
+    Console.WriteLine($"node class: 0x{vtable:X}, canvas: 0x{canvas:X}, enumerated nodes: {nodes.Count}");
+    Console.WriteLine($"direct biome: +0x{Poe2.AtlasNode.Biome:X3}, accepted range: 0..{knownBiomeMax}");
+    Console.WriteLine($"direct readable: {directReadable}, unreadable: {directUnreadable}, out-of-range: {directOutOfRange}");
+    Console.WriteLine($"nodeData usable: {usable}, unresolved storage: {unresolvedStorage}, unresolved nodeData: {unresolvedNodeData}, unreadable DataStatus: {unresolvedDataStatus}");
+    Console.WriteLine($"distinct authoritative biomes: {authoritativeBiomes.Count} [{string.Join(", ", authoritativeBiomes.Order())}]");
+    Console.WriteLine($"scan: nodeData +0x{scanStart:X3}..+0x{scanEnd:X3} (byte offsets, inclusive)");
+    Console.WriteLine();
+    Console.WriteLine("offset reads matches mismatches rate     direct distinct candidate distinct nonzero matches");
+
+    void PrintCandidate(int index)
+    {
+        var rate = reads[index] == 0 ? "n/a" : $"{matches[index] * 100.0 / reads[index],7:0.00}%";
+        Console.WriteLine($"+{scanStart + index:X3} {reads[index],5} {matches[index],7} {mismatches[index],9} {rate} " +
+            $"{directValues[index].Count,15} {candidateValues[index].Count,17} {nonZeroMatches[index],15}");
+    }
+
+    foreach (var i in Enumerable.Range(0, span)) PrintCandidate(i);
+
+    var ranked = Enumerable.Range(0, span)
+        .OrderByDescending(i => reads[i] == 0 ? -1 : matches[i] * 1.0 / reads[i])
+        .ThenByDescending(i => matches[i])
+        .ThenByDescending(i => directValues[i].Count)
+        .ToArray();
+
+    Console.WriteLine("\nRanked candidates:");
+    foreach (var i in ranked.Take(10))
+        Console.WriteLine($"  +{scanStart + i:X3}: {matches[i]}/{reads[i]} exact, " +
+            $"{(reads[i] == 0 ? 0 : matches[i] * 100.0 / reads[i]):0.00}% rate, " +
+            $"direct={directValues[i].Count}, candidate={candidateValues[i].Count}, nonzero={nonZeroMatches[i]}");
+
+    var comparisonOffsets = new[] { 0x2B9, 0x2BA, 0x2BB, 0x2BC, 0x2BD, knownDataBiomeOffset };
+    Console.WriteLine($"\nRequested comparison offsets (known DataBiome=+0x{knownDataBiomeOffset:X3}; +0x2BB is rejected):");
+    foreach (var offset in comparisonOffsets) PrintCandidate(offset - scanStart);
+
+    var exampleOffsets = ranked.Take(8).Concat(comparisonOffsets.Select(offset => offset - scanStart)).Distinct().ToArray();
+    Console.WriteLine("\nMismatch examples (top-ranked and requested offsets):");
+    foreach (var i in exampleOffsets)
+    {
+        if (examples[i].Count == 0) continue;
+        Console.WriteLine($"  +{scanStart + i:X3}: " +
+            string.Join(", ", examples[i].Select(e => $"node=0x{e.Node:X} direct={e.Direct} candidate={e.Candidate}")));
+    }
+
+    var knownIndex = knownDataBiomeOffset - scanStart;
+    Console.WriteLine();
+    Console.WriteLine($"Known DataBiome: +0x{knownDataBiomeOffset:X3} (nodeData + AtlasNode.DataBiome)");
+    if (reads[knownIndex] == 0)
+    {
+        Console.WriteLine("DataBiome validation: no readable samples.");
+    }
+    else if (mismatches[knownIndex] == 0 && directValues[knownIndex].Count >= 3 &&
+             candidateValues[knownIndex].Count >= 3 && nonZeroMatches[knownIndex] > 0)
+    {
+        Console.WriteLine($"DataBiome validation: PASS {matches[knownIndex]}/{reads[knownIndex]} exact " +
+            $"across {directValues[knownIndex].Count} direct and {candidateValues[knownIndex].Count} deep values; no mismatches.");
+    }
+    else
+    {
+        Console.WriteLine($"DataBiome validation: WARNING {matches[knownIndex]}/{reads[knownIndex]} exact, " +
+            $"{mismatches[knownIndex]} mismatches; inspect the regression examples above.");
+    }
+    Console.WriteLine($"Rejected prior +0x2BB: {matches[0x2BB - scanStart]}/{reads[0x2BB - scanStart]} exact, " +
+        $"{(reads[0x2BB - scanStart] == 0 ? 0 : matches[0x2BB - scanStart] * 100.0 / reads[0x2BB - scanStart]):0.00}% " +
+        $"with {candidateValues[0x2BB - scanStart].Count} distinct candidate values.");
+    Console.WriteLine("Direct +0x31E remains the authoritative biome used by normal GPS functionality.");
     return 0;
 }
 
@@ -7019,42 +6880,24 @@ static int RunAtlasWatch(ProcessHandle process, MemoryReader reader)
 {
     var (_, igs, _, _) = ResolveChain(process, reader);
     if (igs == 0) { Console.Error.WriteLine("no chain."); return 1; }
-    var uiRoot = SafePtr(reader, igs + 0x2F0);
-    var htC = SafePtr(reader, uiRoot + 0x7D8);
-    var hoverVtable = process.MainModuleBase + 0x2D707D8;
-    Console.WriteLine($"UiRoot 0x{uiRoot:X}  htContainer 0x{htC:X}  hoverVtable 0x{hoverVtable:X}");
-
-    // Find every hover-tracker instance embedded in the container (its first qword == the hover vtable).
-    var trackers = new List<int>();
-    var cbuf = new byte[0x2000];
-    var cn = reader.TryReadBytes(htC, cbuf);
-    for (var o = 0; o + 8 <= cn; o += 8)
-        if ((nint)BitConverter.ToInt64(cbuf, o) == hoverVtable) trackers.Add(o);
-    Console.WriteLine($"hover-tracker instances at htContainer offsets: {string.Join(", ", trackers.Select(t => $"+0x{t:X}"))}");
-    Console.WriteLine("Hover atlas nodes / maps. Logs the tracker whose +0x18 changes. Ctrl+C to stop.\n");
-
-    var prev = new Dictionary<int, nint>();
+    Console.WriteLine("Watching the current MouseOver chain. Ctrl+C to stop.");
+    nint previous = 0;
     while (true)
     {
-        foreach (var t in trackers)
+        var host = SafePtr(reader, igs + Poe2.MouseOver.HostFromInGameState);
+        var sub = host == 0 ? 0 : SafePtr(reader, host + Poe2.MouseOver.SubFromHost);
+        var hovered = sub == 0 ? 0 : SafePtr(reader, sub + Poe2.MouseOver.EntityFromSub);
+        if (hovered != previous)
         {
-            var hov = SafePtr(reader, htC + t + 0x18);
-            if (prev.TryGetValue(t, out var old) && old == hov) continue;
-            prev[t] = hov;
-            if (hov == 0) continue;
-            var isEl = SafePtr(reader, hov + 0x08) == hov;
-            var meta = ReadEntityMetadata(reader, hov);
-            reader.TryReadStruct<uint>(hov + 0x300, out var id);
-            reader.TryReadStruct<uint>(hov + 0x310, out var content);
-            reader.TryReadStruct<byte>(hov + 0x32C, out var state);
-            reader.TryReadStruct<byte>(hov + 0x32E, out var biome);
-            reader.TryReadStruct<byte>(hov + 0x32F, out var flags);
-            reader.TryReadStruct<byte>(hov + 0x339, out var compl);
-            reader.TryReadStruct<float>(hov + 0x118, out var px);
-            reader.TryReadStruct<float>(hov + 0x11C, out var py);
-            Console.WriteLine($"[tracker +0x{t:X}] hov=0x{hov:X} el={isEl} vtable=0x{SafePtr(reader, hov):X}");
-            if (isEl) Console.WriteLine($"    node? id={id} content={content} state={state} biome={biome} flags=0x{flags:X2}(unlk={flags & 1} vis={(flags >> 1) & 1}) compl={compl} pos=({px:F0},{py:F0})");
-            if (Printable(meta)) Console.WriteLine($"    meta='{meta}'");
+            previous = hovered;
+            if (hovered != 0)
+            {
+                reader.TryReadStruct<int>(hovered + Poe2.AtlasNode.GridPos, out var gx);
+                reader.TryReadStruct<int>(hovered + Poe2.AtlasNode.GridPos + 4, out var gy);
+                var map = ReadAtlasRolledMapCode(reader, hovered);
+                var meta = ReadEntityMetadata(reader, hovered);
+                Console.WriteLine($"hovered=0x{hovered:X} grid=({gx},{gy}) map=\"{map}\" metadata=\"{meta}\"");
+            }
         }
         Thread.Sleep(300);
     }
@@ -7134,15 +6977,9 @@ static string ShortMeta(MemoryReader reader, nint el)
     return "";
 }
 
-// ── Atlas UI walker: find the Atlas node subtree and decode the node UiElement ──
-// The PoE2 Atlas is a tree/graph UI (cf. GH2 SkillTreeNodeUiElement = UiElementBase + a pointer to
-// the node's dat row). Our PoE2 UiElement is validated only at Self@+0x08, Children@+0x10,
-// Flags@+0x180; the StringId / Parent / Position / node-data-ptr offsets drifted from GH2 and are
-// rediscovered here. BFS the UI tree from UiRoot (InGameState+0x2F0); find the element(s) carrying
-// the hovered map name "<token>" inline (a short name is SSO-inline in a StdWString, so one cheap
-// IndexOf over each element's body catches it without extra syscalls). For each match, print its
-// ancestry + a byte dump + an interpretation pass (plausible screen-position floats, and pointer
-// fields whose targets look like the map-type dat row) so the node-data offset can be pinned.
+// ── Atlas UI walker: find the Atlas node subtree and decode the node UiElement ──────────────────
+// This raw scanner uses the current named UiElement layout and starts at the configured UiRoot.
+// It locates the supplied token in element memory, then prints ancestry and candidate fields.
 static int RunAtlasUi(ProcessHandle process, MemoryReader reader, string token)
 {
     var (_, inGameState, _, _) = ResolveChain(process, reader);
@@ -7395,7 +7232,7 @@ static int RunFindMap(ProcessHandle process, MemoryReader reader)
         {
             reader.TryReadStruct<uint>(cur + 0x88, out var f88);
             reader.TryReadStruct<uint>(cur + 0xA8, out var fA8);
-            reader.TryReadStruct<uint>(cur + 0x180, out var f180); // ← current validated Flags offset
+            reader.TryReadStruct<uint>(cur + 0x180, out var f180); // legacy candidate retained for comparison
             reader.TryReadStruct<uint>(cur + 0x190, out var f190);
             reader.TryReadStruct<uint>(cur + 0x1B8, out var f1B8);
             Console.WriteLine($"  0x{cur:X16}  [+0x180]={f180:X8} (bit0x0B={((f180 >> 0x0B) & 1)})  [+0x88]={f88:X8} [+0xA8]={fA8:X8} [+0x190]={f190:X8} [+0x1B8]={f1B8:X8}");
@@ -7420,9 +7257,8 @@ static int RunFindMap(ProcessHandle process, MemoryReader reader)
 
 // ── PoE2 top-level chain resolver ───────────────────────────────────────────
 // AOB "Game States" → GameState → CurrentStatePtr StdVector @+0x08; its first element is the
-// active InGameState. InGameState+0x290 → AreaInstance. AreaInstance+0x5A0 → LocalPlayer.
-// Validated live (resolved LocalPlayer == the value-scanned player entity). Falls back to
-// scanning the 12 States[] slots if the current-state vector doesn't validate.
+// active InGameState. The remaining hops use Poe2.InGameState.AreaInstanceData and
+// Poe2.AreaInstance.LocalPlayer. Falls back to scanning the 12 States[] slots if needed.
 static (nint gameState, nint inGameState, nint areaInstance, nint localPlayer) ResolveChain(
     ProcessHandle process, MemoryReader reader)
 {
@@ -7452,10 +7288,9 @@ static (nint gameState, nint inGameState, nint areaInstance, nint localPlayer) R
     return (0, 0, 0, 0);
 }
 
-// Verbose stage-by-stage chain walk to localize post-patch drift. Prints each AOB gameState hit,
-// every InGameState candidate (current-state vec + 12 States slots), the AreaInstance @ +0x290, and
-// scans a wide offset window inside the AreaInstance for any pointer that resolves to a "Metadata/"
-// entity (= the drifted LocalPlayer offset).
+// Verbose stage-by-stage chain walk to localize post-patch drift. Prints each AOB GameState hit,
+// every InGameState candidate, and the AreaInstance at the configured offset, then scans inside the
+// AreaInstance for pointers resolving to a Metadata entity.
 static int RunChainDebug(ProcessHandle process, MemoryReader reader)
 {
     Console.WriteLine("\n=== CHAIN DEBUG ===");

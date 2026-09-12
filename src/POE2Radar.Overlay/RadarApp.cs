@@ -205,8 +205,7 @@ public sealed class RadarApp : IDisposable
     private long _lastAtlasSig;          // view+inputs signature — when unchanged, marks/route stay frozen (no arrow jitter)
     private bool _builtAtlasOnce;        // marks built at least once this atlas session (world)
     private readonly List<float> _atlasSortBuf = new();   // E5: reused median buffer (world thread)
-    // Live atlas zoom (= canvas/node scale @ +0x130; 0.85 max-out … larger zoomed in). relPos is read
-    // live (pan baked in) and the projection scales by this zoom, so rings track pan AND zoom.
+    // Live atlas zoom from UiElement.LocalScaleMul. RelativePos already includes pan.
     private volatile float _atlasZoom = 0.85f;
     private volatile UpdateChecker.Result? _update;   // GitHub version check (best-effort, set async at startup)
     // Atlas projection is derived live from the game window height (UIscale = winH/1600 × live zoom) in
@@ -1534,7 +1533,7 @@ monolithProbeReader: _readerApi,
 
             if (alive && _resolvedSlot == 0)
             {
-                var slot = Bootstrap.ScanForSlot(_process, resolverReader, out var candidates);
+                var slot = Bootstrap.ScanForSlot(_process, resolverReader, out var candidates, out var stage);
                 _aobCandidates = candidates;
                 _aobScanned = true;
                 if (slot != 0)
@@ -1545,8 +1544,8 @@ monolithProbeReader: _readerApi,
                 else
                 {
                     ConsoleTheme.WarnLine(candidates == 0
-                        ? "  Waiting — game-state pattern not found yet (load into a zone; if this persists POE2GPS may need an update)."
-                        : "  Waiting for in-game state — load into a zone.");
+                        ? "  Waiting — GameState AOB not found (current client signature may have drifted)."
+                        : $"  Waiting — GameState AOB matched {candidates} candidate(s), deepest chain: {stage}.");
                 }
             }
             Thread.Sleep(1500);
@@ -1933,7 +1932,7 @@ monolithProbeReader: _readerApi,
             : (POE2Radar.Core.Campaign.Guide.CampaignStepInstruction?)null;
         _state = new RadarState(inGame, snap.AreaHash, snap.AreaLevel, map.IsVisible, map.Zoom, player,
             snap.Entities, snap.Landmarks, _hpPct, _manaPct, _esPct,
-            snap.AreaCode ?? "", "", snap.CharLevel, _worldMs, _renderMs, mr.Markers, _directorQueue, _fps,
+            snap.AreaCode ?? "", inGame ? _liveRender.AreaName(areaInstance) : "", snap.CharLevel, _worldMs, _renderMs, mr.Markers, _directorQueue, _fps,
             Session: _sessionSnapshot, Health: _healthState, HealthMessage: _healthMessage, CampaignGps: _campaignGps,
             RpmPerSec: _rpmPerSec,
             CampaignGuide: campaignGuideSnapshot)
@@ -2937,15 +2936,15 @@ monolithProbeReader: _readerApi,
         }
         if ((bestIn ?? bestAny) is not { } b) { Console.WriteLine("\n[atlas route] no tile under cursor (is the Atlas open?)."); return; }
 
-        // Dump the hovered tile's full identity so the user can set web-UI filters even when the display
-        // name is unusual: the REAL map name (WorldAreas +0x08), the raw internal code (never localized,
-        // always a safe match key), the rolled content tags, biome and grid coord.
-        var content = b.Tags.Count > 0 ? string.Join(", ", b.Tags) : "(none)";
-        Console.WriteLine($"\n[atlas tile] \"{LocalizedMapName(b.MapCode, b.MapName)}\"  code={b.MapCode}  kind={b.Kind}  grid={b.Grid}  biome={b.Biome}");
+        // Dump the hovered tile's current identity and validated grid coordinate.
+        var content = b.ContentNames.Count > 0 ? string.Join(", ", b.ContentNames) : "(none)";
+        var contentIds = b.ContentIds.Count > 0 ? string.Join(", ", b.ContentIds) : "(none)";
+        Console.WriteLine($"\n[atlas tile] \"{LocalizedMapName(b.MapCode, b.MapName)}\"  code={b.MapCode}  kind={b.Kind}  grid={b.Grid}");
+        Console.WriteLine($"            state=0x{b.State:X2} mapRowIndex={b.MapRowIndex} biome={b.Biome} completion={b.Completion}");
         // Status cross-validation (improvement 1): deeper-model accessible/completed vs the element flag bits.
         Console.WriteLine($"            accessible={b.Accessible} completed={b.Completed}  (elem flags=0x{b.Flags:X2}: unlocked={b.Unlocked} visited={b.Visited})");
-        Console.WriteLine($"             content: {content}");
-        Console.WriteLine($"             web-UI filters -> Map: \"{LocalizedMapName(b.MapCode, b.MapName)}\"" + (b.Tags.Count > 0 ? $"   Content: {content}" : ""));
+        Console.WriteLine($"             contentIds: [{contentIds}]  names: {content}");
+        Console.WriteLine($"             web-UI filters -> Map: \"{LocalizedMapName(b.MapCode, b.MapName)}\"" + (content != "(none)" ? $"   Content: {content}" : ""));
 
         // 1st press → set START · 2nd press → set END (route computed each tick) · 3rd → reset. The grids
         // are read by the world thread (UpdateAtlas/BuildAtlasRoute), so mutate them under _atlasLock —
@@ -3710,7 +3709,6 @@ monolithProbeReader: _readerApi,
                 hasContent = nodes.Count(n => n.HasContent),
                 unvisited = nodes.Count(n => !n.Visited),
                 unlocked = nodes.Count(n => n.Unlocked),
-                biomes = nodes.GroupBy(n => (int)n.Biome).OrderBy(g => g.Key).ToDictionary(g => g.Key.ToString(), g => g.Count()),
             },
             // v0.41.4 field diagnostic: exposes atlas-panel-open child-index scan results so users
             // reporting "atlas closed" false positives can share the payload for offset re-discovery.
@@ -3737,10 +3735,9 @@ monolithProbeReader: _readerApi,
                 signatureMatches     = _atlas.LastProbe.SignatureMatchingCandidates,
                 totalUiRootChildren  = _atlas.LastProbe.TotalUiRootChildren,
             },
-            // Every distinct content tag currently on the atlas (+ count), for the dashboard's filter /
-            // highlight-rule pickers. These are the readable content/mechanic names (Powerful Map Boss,
-            // Breach, Delirium, …) resolved from each node's EndgameMapAtlas row.
-            allTags = nodes.SelectMany(n => n.Tags).GroupBy(t => t).OrderByDescending(g => g.Count())
+            // Every distinct name resolved from the current node ContentIds vectors (+ count), for the
+            // dashboard's filter/highlight-rule pickers. Unknown live ids remain in nodeList.contentIds.
+            allTags = nodes.SelectMany(n => n.ContentNames).GroupBy(t => t).OrderByDescending(g => g.Count())
                 .Select(g => new { tag = g.Key, count = g.Count(), desc = POE2Radar.Core.Game.AtlasMapData.Shared.ContentDesc(g.Key), icon = POE2Radar.Core.Game.AtlasMapData.Shared.ContentIcon(g.Key) }),
             // Distinct MAP NAMES (Sun Temple, Precursor Tower, Vaal City, …) — the separate "Map" filter
             // group, so towers/temples/specific maps are highlightable independently of rolled content.
@@ -3768,10 +3765,12 @@ monolithProbeReader: _readerApi,
                 .Select(n => new
                 {
                     el = ((long)n.Element).ToString(), // unique stable key (element address) for selection
-                    id = n.Id, biome = (int)n.Biome, type = n.IconType, hasContent = n.HasContent,
+                    id = n.Id, state = n.State, mapRowIndex = n.MapRowIndex, biome = n.Biome,
+                    flags = n.Flags, completion = n.Completion, hasContent = n.HasContent,
                     unlocked = n.Unlocked, visited = n.Visited, visible = n.Visible,
                     accessible = n.Accessible, completed = n.Completed, kind = n.Kind,
-                    x = (int)n.X, y = (int)n.Y, map = LocalizedMapName(n.MapCode, n.MapName), tags = n.Tags,
+                    x = (int)n.X, y = (int)n.Y, map = LocalizedMapName(n.MapCode, n.MapName),
+                    contentIds = n.ContentIds, contentNames = n.ContentNames, tags = n.Tags,
                 }),
         };
     }
@@ -3879,8 +3878,7 @@ monolithProbeReader: _readerApi,
             return;                                          // (manual START/END grids persist)
         }
         _atlasGoodAt = DateTime.UtcNow;
-        // Live zoom = the nodes' shared canvas scale (+0x130). Use the median (robust to a stray 0/odd node).
-        // Drives both the ring projection and the route projection (relPos × winH/1600 × zoom).
+        // Use the median live LocalScaleMul; this drives both ring and route projection.
         // E5: reuse _atlasSortBuf to avoid per-tick LINQ allocation.
         _atlasSortBuf.Clear();
         foreach (var n in nodes) if (n.Scale > 0.01f) _atlasSortBuf.Add(n.Scale);
@@ -4026,10 +4024,10 @@ monolithProbeReader: _readerApi,
             // #5 on-node content icons: resolve this node's content tags to icon asset basenames. Drawn on
             // tracked nodes and, crucially, on FOGGED nodes the game hides icons on (surfacing what's hidden).
             IReadOnlyList<string>? contentIcons = null;
-            if (_settings.AtlasShowContentIcons && n.Tags is { Count: > 0 })
+            if (_settings.AtlasShowContentIcons && n.ContentNames is { Count: > 0 })
             {
                 List<string>? ic = null;
-                foreach (var t in n.Tags)
+                foreach (var t in n.ContentNames)
                     if (POE2Radar.Core.Game.AtlasMapData.Shared.ContentIcon(t) is { Length: > 0 } bn && (ic ??= new List<string>()).Contains(bn) == false)
                         ic!.Add(bn);
                 contentIcons = ic;
@@ -4057,7 +4055,7 @@ monolithProbeReader: _readerApi,
                 AtlasGeometry.AtlasCentre(n.Y, n.H),
                 n.W, n.H,
                 isTracked, n.HasContent, n.Visited, n.Unlocked,
-                n.Biome, n.IconType, label, color, isArrow, isNav, n.Element,
+                (int)n.Biome, label, color, isArrow, isNav, n.Element,
                 contentIcons, n.Visible,
                 n.GridX, n.GridY));   // v0.19.6: stable grid coord for off-screen grid-based arrows
         }

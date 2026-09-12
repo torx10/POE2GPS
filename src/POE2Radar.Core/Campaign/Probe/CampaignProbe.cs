@@ -51,7 +51,7 @@ internal sealed record ProbeAccessors(
     TryReadTransitionableStateDelegate            TryReadTransitionableState,
     TryReadTriggerableBlockageDelegate            TryReadTriggerableBlockage,
     TryReadQuestFlagDelegate                      TryReadQuestFlag,
-    Func<nint, nint>                              HoveredEntityViaTracker,
+    Func<nint, nint>                              MouseOverEntity,
     Func<nint, uint, IEnumerable<nint>>           WalkUiTree);
 
 /// <summary>
@@ -129,7 +129,7 @@ public sealed class CampaignProbe
                    TryReadTransitionableState: live.TryReadTransitionableState,
                    TryReadTriggerableBlockage: live.TryReadTriggerableBlockage,
                    TryReadQuestFlag:           live.TryReadQuestFlag,
-                   HoveredEntityViaTracker:    live.HoveredEntityViaTracker,
+                   MouseOverEntity:              live.MouseOverEntity,
                    WalkUiTree:                 live.WalkUiTree),
                bootId, nowMs: null) { }
 
@@ -411,10 +411,10 @@ public sealed class CampaignProbe
             }
         }
 
-        // npc_dialogue_started — edge from "no dialog" to "dialog + hover-tracker at NPC entity".
+        // npc_dialogue_started — edge from "no dialog" to "dialog + current MouseOver entity".
         if (dialogOpen && !_wasDialogOpen)
         {
-            var hovered = _acc.HoveredEntityViaTracker(snap.InGameState);
+            var hovered = _acc.MouseOverEntity(snap.InGameState);
             if (hovered != 0 && TryFindNpc(hovered, snap.Entities, out var npcMeta, out var npcGrid))
             {
                 _lastDialogNpcAddr = hovered;

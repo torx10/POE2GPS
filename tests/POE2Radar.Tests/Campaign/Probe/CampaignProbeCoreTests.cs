@@ -56,7 +56,7 @@ public sealed class CampaignProbeCoreTests : IDisposable
             TryReadTransitionableState: (nint _, out short s) => { s = 0; return false; },
             TryReadTriggerableBlockage: (nint _, out bool b) => { b = false; return false; },
             TryReadQuestFlag:           (nint _, uint _, out bool v) => { v = false; return false; },
-            HoveredEntityViaTracker:    _ => HoverEntity,
+            MouseOverEntity:           _ => HoverEntity,
             WalkUiTree:                 (_, _) => UiTreeElements);
 
         private bool TryReadTargetable(nint entity, out byte isTargetable, out byte isHighlight, out byte isTargeted, out byte isHidden)

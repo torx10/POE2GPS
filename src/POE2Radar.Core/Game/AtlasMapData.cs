@@ -12,13 +12,13 @@ namespace POE2Radar.Core.Game;
 /// (normal/unique) + <c>group</c> + cross-cutting <c>tags</c> (<c>lineage</c>, <c>arbiter</c>, …). This
 /// gives us classification the code-prefix <see cref="Poe2Atlas.Classify"/> can't derive.</para>
 ///
-/// <para><b>atlas_content.json</b> — keyed by content id, but consumed here as a content <b>display
-/// name → {icon basename, effect description}</b> map (our rolled-content tags arrive as names, not
-/// ids, so the id key is only used during load).</para>
+/// <para><b>atlas_content.json</b> — the checked-in numeric content snapshot keyed by the live byte
+/// <c>ContentId</c>. It supplies display name, icon basename, and effect description when the current
+/// id is known. The live EndgameMapContent.dat table base and VisualIdentity row are not exposed by this
+/// repository, so this reader deliberately does not guess either pointer chain.</para>
 ///
-/// <para>Loaded once; read-only. Unmapped ids degrade gracefully (the live name still shows). Mirrors
-/// <see cref="ZoneGuide"/> / <see cref="EntityNameResolver"/>. The <c>translates</c> blocks are imported
-/// but unused for now (English-only) so localization stays a future drop-in.</para>
+/// <para>Loaded once; read-only. Unmapped ids remain available as raw byte ids in the live node snapshot.
+/// The <c>translates</c> blocks are imported but unused for now (English-only).</para>
 /// </summary>
 public sealed class AtlasMapData
 {
@@ -42,9 +42,14 @@ public sealed class AtlasMapData
         }
     }
 
+    /// <summary>Offline metadata for one numeric EndgameMapContent id. The id is the byte stored in
+    /// the live node's ContentIds vector; no pointer from the game process is retained.</summary>
+    public readonly record struct ContentMeta(byte Id, string Name, string Icon, string Description);
+
     private readonly Dictionary<string, MapMeta> _maps = new(StringComparer.OrdinalIgnoreCase);    // MapId → meta
     private readonly Dictionary<string, string> _contentDesc = new(StringComparer.OrdinalIgnoreCase); // content name → effect text
     private readonly Dictionary<string, string> _contentIcon = new(StringComparer.OrdinalIgnoreCase); // content name → icon basename
+    private readonly Dictionary<byte, ContentMeta> _contents = new(); // live ContentId → offline metadata
 
     private static readonly string[] NoTags = Array.Empty<string>();
 
@@ -53,8 +58,11 @@ public sealed class AtlasMapData
 
     /// <summary>Number of mapped archetypes (0 ⇒ the table failed to load).</summary>
     public int MapCount => _maps.Count;
-    /// <summary>Number of content types with a description/icon.</summary>
-    public int ContentCount => _contentDesc.Count + _contentIcon.Count;
+    /// <summary>Number of numeric content ids in the checked-in snapshot.</summary>
+    public int ContentCount => _contents.Count;
+
+    /// <summary>Offline metadata for a live byte ContentId. Returns false when the snapshot has no row.</summary>
+    public bool TryGetContent(byte id, out ContentMeta meta) => _contents.TryGetValue(id, out meta);
 
     /// <summary>Offline metadata for an internal MapId, or null when unmapped.</summary>
     public MapMeta? Get(string? mapId)
@@ -118,18 +126,20 @@ public sealed class AtlasMapData
                     }
                 }
 
-            // ── atlas_content.json: id → { name, icon, desc } → keyed here by display NAME ───────────
+            // ── atlas_content.json: numeric id → { name, icon, desc } snapshot ────────────────────────
             using (var s = OpenResource(asm, "atlas_content"))
                 if (s != null)
                 {
                     var doc = JsonDocument.Parse(s);
                     foreach (var prop in doc.RootElement.EnumerateObject())
                     {
+                        if (!byte.TryParse(prop.Name, out var id)) continue;
                         var v = prop.Value;
                         var name = Str(v, "name");
                         if (name.Length == 0) continue;
                         var icon = Str(v, "icon");
                         var desc = Str(v, "desc");
+                        data._contents[id] = new ContentMeta(id, name, icon, desc);
                         if (icon.Length > 0) data._contentIcon[name] = icon;
                         if (desc.Length > 0) data._contentDesc[name] = desc;
                     }

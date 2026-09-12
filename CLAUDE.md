@@ -103,10 +103,12 @@ find a buffed scalar), `--devtree` (browser-based live memory/UI/entity explorer
 `localhost:7778` — `DevTree/DevTreeServer.cs` + `DevTreeHtml.cs`; the PoE2 stand-in for ExileApi's
 DevTree), and `--atlas-probe` (one-shot ATLAS PROJECTION recovery/validation — run with the Atlas map
 open after a patch: re-locates the node class + canvas, validates every offset (PASS/⚠DRIFT), and prints
-the derived projection + paste-ready offsets; the `--atlas-{xform,canvas,nodes2,readnodes,corr}` probes
-remain for deep re-discovery), and `--atlas-graph` (validates the node GRAPH — per-node grid coords
-`AtlasNode.GridPos +0x320` + the connection-edge `StdVector` `AtlasGraph.ConnectionsVec` on the canvas
-`+0x5A8`; brute-scans for both so it self-heals on drift — the basis for node-to-node atlas pathfinding).
+the derived projection + paste-ready offsets; `--atlas-databiome` validates `AtlasNode.DataBiome +0x2BE`
+against direct `Biome +0x31E` across the deep node-data window and reports regression mismatches), the
+`--atlas-{xform,canvas,nodes2,readnodes,corr}` probes remain for deep re-discovery, and `--atlas-graph`
+validates the node GRAPH — per-node grid coords (`AtlasNode.GridPos +0x310`) + the connection-edge
+`StdVector` `AtlasGraph.ConnectionsVec` on the canvas `+0x5A8`; brute-scans for both so it self-heals
+on drift — the basis for node-to-node atlas pathfinding.
 
 **Atlas overlay projection** (✓ live, pan + zoom): atlas nodes are UiElements; a node's screen pos is
 `screen = (UIscale × zoom) × relPos + offset` — relPos `+0x118` (read live; PAN is baked in), zoom =
@@ -130,6 +132,9 @@ is rescaled by liveZoom/calibZoom each frame. See `resources/atlas-research-note
   0x230 → 0x248 (0.5.4) → 0x264 (2026-07-02) → 0x24C (2026-07-10). `Poe2Live.EnsureVitalOffsets`
   auto-heals it at runtime, so re-validate with Research `--vitals` and re-bake rather than trusting
   this line); Player name `+0x1B0`, level `+0x204`.
+- Atlas node: direct `Biome +0x31E` is the primary GPS value. The deep mirror resolves through
+  `DataStorage +0x10` → `DataModel +0x20`; `DataBiome +0x2BE` is runtime validated `4997/4997`
+  across `11` distinct biome values, while `DataStatus +0x2BC` remains the validated status byte.
 - Map UI: UiRoot `InGameState +0x2F0`; UiElement Self `+0x08`, Children `+0x10`, Flags `+0x180`
   (visible = bit `0x0B`); MapUiElement Shift `+0x368`, DefaultShift `+0x370` (= (0,-20)), Zoom `+0x3A8`.
 - Inventory (✓ live, Research `--inventory`): `AreaInstance +0x5A0` → ServerData → `+0x48` PlayerServerData

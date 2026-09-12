@@ -415,11 +415,6 @@ public sealed class OverlayRenderer : IDisposable
                 _bStyle.Color = ctx.AtlasBiomeBorder ? BiomeColor(n.Biome) : col;
                 rt.FillEllipse(new Ellipse(c, 3f, 3f), _bStyle);
             }
-            else if (n.IconType > 0) // DEBUG (AtlasDrawAll): content-tag element
-            {
-                _bStyle!.Color = new Color4(1f, 0.9f, 0.2f, 0.9f);
-                rt.DrawEllipse(new Ellipse(c, 7f, 7f), _bStyle, 2f);
-            }
             else if (n.Visited)
             {
                 _bStyle!.Color = new Color4(1f, 0.2f, 1f, 1f);
@@ -432,16 +427,15 @@ public sealed class OverlayRenderer : IDisposable
                                : new Color4(0.43f, 0.91f, 0.53f, 0.85f);
                 rt.DrawEllipse(new Ellipse(c, 11f, 11f), _bStyle, 2f);
             }
-            // #5 content icons: drawn in a row above the node, but ONLY on FOGGED nodes (the game already
-            // renders its own content icons on revealed ones, so we'd double up). Tracked rings + icons can
-            // co-exist on a fogged tracked node. Ring radius below mirrors the ring drawn above.
+            // Content icons are catalog-derived from the node's byte ContentIds; only fogged nodes need
+            // them because the game draws its own icons on revealed nodes.
             if (ctx.AtlasContentIcons && !n.Visible && n.ContentIcons is { Count: > 0 } && _atlasIcons != null)
             {
                 float ringR = (n.Selected || n.Arrow) ? 12f : (n.Nav ? 9f : 0f);
                 DrawAtlasContentIcons(rt, n.ContentIcons, sx, sy - ringR, ctx.AtlasContentIconSize);
             }
 
-            var label = n.Label ?? (n.IconType > 0 ? n.IconType.ToString() : null);
+            var label = n.Label;
             if (label != null)
             {
                 // Backing chip behind the label (improvement 2) so map names stay readable over the busy

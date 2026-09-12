@@ -47,22 +47,27 @@ public static class AobPatterns
     ];
 
     /// <summary>
-    /// PoE2 "Game States" pattern (upstream reference):
-    ///   <c>48 39 2D ^ ?? ?? ?? ?? 0F 85 16 01 00 00</c>
+    /// PoE2 "Game States" pattern (GameHelper2 StaticOffsetsPatterns.cs):
+    ///   <c>48 39 2D ^ ?? ?? ?? ?? 0F 85</c>
     /// The instruction is <c>cmp [rip+rel32], rbp</c> (48 39 2D + rel32 = 7 bytes); the rel32
     /// resolves to the GameStates global pointer slot. Deref the slot → GameState root.
-    /// The trailing <c>0F 85 …</c> (jnz) is included for uniqueness.
+    /// The JNZ displacement is wildcarded because it changes between client builds; the longer
+    /// suffix keeps the signature selective and Bootstrap validates every resolved candidate.
     /// </summary>
     public static readonly Pattern[] GameStateRefs =
     [
         new Pattern(
             Bytes: new byte?[] {
                 0x48, 0x39, 0x2D, null, null, null, null,
-                0x0F, 0x85, 0x16, 0x01, 0x00, 0x00
+                0x0F, 0x85, null, null, null, null,
+                0xB9, null, null, null, null,
+                0xE8, null, null, null, null,
+                0x48, 0x8B, 0xF8,
+                0x48, 0x89, 0x44, 0x24, 0x50
             },
-            DispOffset:  3,   // rel32 starts after 48 39 2D
-            InstrLen:    7,   // cmp [rip+rel32], rbp
-            Description: "PoE2 GameStates global slot (upstream reference 'Game States')"),
+            DispOffset:  3,
+            InstrLen:    7,
+            Description: "PoE2 GameStates global slot (GameHelper2 'Game States')"),
     ];
 
     /// <summary>

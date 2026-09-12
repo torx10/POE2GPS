@@ -37,13 +37,13 @@ POE2Radar.Overlay.DiagnosticsLog.Init();
 // ── v0.19.1 auto-update (runs only in the --launched real instance, before attaching to the game) ──
 var installDir = Path.GetDirectoryName(Environment.ProcessPath);
 var startupSettings = RadarSettings.Load();
+var localBuild = UpdateChecker.IsLocalBuild;
 if (installDir != null)
 {
-    // A crash-looping update rolls back to Overlay.old.exe (safety — runs regardless of mode).
-    if (POE2Radar.Overlay.Update.AutoUpdater.RollbackIfCrashLooping(installDir)) return 0;
-    // Apply an update staged by a previous session (silent mode), then relaunch into it.
-    // Non-silent: prune any stale staged file so PendingVersion() can't show a false banner.
-    if (startupSettings.AutoUpdate.Mode == "silent")
+    // Local source builds are custom patched binaries: retain the updater for release builds, but
+    // never roll back, apply, or retain a staged release over a local build.
+    if (!localBuild && POE2Radar.Overlay.Update.AutoUpdater.RollbackIfCrashLooping(installDir)) return 0;
+    if (!localBuild && startupSettings.AutoUpdate.Mode == "silent")
     {
         if (POE2Radar.Overlay.Update.AutoUpdater.ApplyStagedIfPresent(UpdateChecker.Current, installDir)) return 0;
     }
@@ -71,12 +71,11 @@ Console.WriteLine();
 POE2Radar.Overlay.Overlay.ConsoleTheme.Accent("Running. The overlay connects automatically once you're in a zone. Ctrl+C to exit.");
 
 // Update check (banner) + silent background staging for NEXT launch — never blocks startup.
-// updateTask is non-null whenever Mode != "off"; CheckAndStageAsync reuses it (precheck) so
-// silent mode makes exactly ONE GitHub request per launch instead of two.
+// Local source builds are update-disabled; release builds keep the configured off/notify/silent behavior.
 System.Threading.Tasks.Task<UpdateChecker.Result>? updateTask = null;
-if (startupSettings.AutoUpdate.Mode != "off")
+if (!localBuild && startupSettings.AutoUpdate.Mode != "off")
     updateTask = System.Threading.Tasks.Task.Run(() => UpdateChecker.CheckAsync());
-if (startupSettings.AutoUpdate.Mode == "silent" && installDir != null)
+if (!localBuild && startupSettings.AutoUpdate.Mode == "silent" && installDir != null)
     _ = System.Threading.Tasks.Task.Run(() =>
         POE2Radar.Overlay.Update.AutoUpdater.CheckAndStageAsync("silent", UpdateChecker.Current, installDir, System.Threading.CancellationToken.None, precheck: updateTask, settings: startupSettings));
 

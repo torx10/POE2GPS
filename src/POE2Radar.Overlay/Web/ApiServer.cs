@@ -1157,9 +1157,8 @@ public sealed class ApiServer : IDisposable
                 break;
 
             case "/api/probe/atlas-graph":
-                // v0.42 B3a: Atlas-graph diagnostic endpoint. Loopback-gated (dumps raw pointers).
-                // Returns sweep results at candidate offsets for 3 AtlasNode fields (ConnectionsVec,
-                // GridPos, Biome). Probe-only — no auto-heal in this bead.
+                // Loopback-only raw sweeps for the connection graph, GridPos, and current per-node fields.
+                // ContentIds is a guarded std::vector<byte>; no legacy scalar or child-element heuristic is used.
                 if (!IsLoopbackHost(ctx.Request))
                 {
                     Write(ctx, 403, JsonSerializer.Serialize(new { error = "loopback-only" }, Json));
@@ -1185,20 +1184,39 @@ public sealed class ApiServer : IDisposable
                     var gridPos = reader != null
                         ? AtlasGraphProber.SweepGridPos(firstNode, reader)
                         : Array.Empty<ProbeSample<GridPosShape>>();
-                    var biome = reader != null
-                        ? AtlasGraphProber.SweepBiome(firstNode, reader)
-                        : Array.Empty<ProbeSample<int>>();
+                    byte state = 0, mapRowIndex = 0, biome = 0, flags = 0, completion = 0;
+                    Poe2Atlas.ContentVectorInfo contentVector = default;
+                    IReadOnlyList<byte> contentIds = Array.Empty<byte>();
+                    IReadOnlyList<string> contentNames = Array.Empty<string>();
+                    if (reader != null && firstNode != 0)
+                    {
+                        reader.TryReadStruct<byte>(firstNode + Poe2.AtlasNode.State, out state);
+                        reader.TryReadStruct<byte>(firstNode + Poe2.AtlasNode.MapRowIndex, out mapRowIndex);
+                        reader.TryReadStruct<byte>(firstNode + Poe2.AtlasNode.Biome, out biome);
+                        reader.TryReadStruct<byte>(firstNode + Poe2.AtlasNode.Flags, out flags);
+                        reader.TryReadStruct<byte>(firstNode + Poe2.AtlasNode.Completion, out completion);
+                        var atlas = new Poe2Atlas(reader);
+                        contentVector = atlas.ReadContentVector(firstNode);
+                        contentIds = atlas.ReadContentIds(firstNode);
+                        contentNames = contentIds.Select(id => AtlasMapData.Shared.TryGetContent(id, out var meta)
+                            ? meta.Name : $"#{id}").ToArray();
+                    }
 
                     var samples = new List<object>
                     {
                         new
                         {
                             firstNodeAddr = $"0x{firstNode:X}",
+                            nodeFields = new
+                            {
+                                state, mapRowIndex, biome, flags, completion,
+                                contentVector, contentIds,
+                                contentNames
+                            },
                             sweeps = new
                             {
                                 connectionsVec,
-                                gridPos,
-                                biome
+                                gridPos
                             }
                         }
                     };
@@ -2742,7 +2760,7 @@ public sealed class ApiServer : IDisposable
         enableAudioAlerts        = _settings.EnableAudioAlerts,
         audioAlertRareUnique     = _settings.AudioAlertRareUnique,
         audioAlertUniqueDrop     = _settings.AudioAlertUniqueDrop,
-        audioAlertObjective      = _settings.AudioAlertObjective,
+        audioAlertObjective       = _settings.AudioAlertObjective,
         audioAlertRadiusCells    = _settings.AudioAlertRadiusCells,
         audioAlertVolume         = _settings.AudioAlertVolume,
         audioToneMonster         = _settings.AudioToneMonster,

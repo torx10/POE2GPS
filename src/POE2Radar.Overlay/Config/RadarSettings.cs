@@ -249,8 +249,8 @@ public sealed class RadarSettings
     // Suppress auto-routes longer than this many map hops (0 = no limit). Keeps the view readable when a
     // common content type (e.g. Breach) is tracked across the whole atlas.
     public int AtlasAutoRouteMaxHops { get; set; } = 0;
-    // Draw a biome-coloured border around tracked map labels on the open Atlas (richer in-game info). On by default.
-    public bool AtlasShowBiomeBorder { get; set; } = true;
+    // When enabled, tracked atlas nodes use their live byte Biome field for the centre-dot colour.
+    public bool AtlasShowBiomeBorder { get; set; } = false;
     // Filter: hide completed (run) maps from the atlas overlay — declutters heavily-run atlases. On by default.
     public bool AtlasHideCompleted { get; set; } = true;
     // Filter: hide accessible-only (adjacent but not tracked) maps. Off by default (too aggressive for first-time users).

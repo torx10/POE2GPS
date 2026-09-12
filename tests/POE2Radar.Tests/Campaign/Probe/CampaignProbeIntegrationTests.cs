@@ -53,7 +53,7 @@ public sealed class CampaignProbeIntegrationTests : IDisposable
             TryReadTransitionableState: (nint _, out short s) => { s = 0; return false; },
             TryReadTriggerableBlockage: (nint _, out bool b) => { b = false; return false; },
             TryReadQuestFlag:           (nint _, uint _, out bool v) => { v = false; return false; },
-            HoveredEntityViaTracker:    _ => 0,
+            MouseOverEntity:           _ => 0,
             WalkUiTree:                 (_, _) => UiElements);
     }
 

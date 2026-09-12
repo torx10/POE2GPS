@@ -69,7 +69,7 @@ public readonly record struct PanelHighlight(float UnscaledX, float UnscaledY, f
 public readonly record struct AtlasMark(
     float X, float Y, float W, float H,
     bool Selected, bool HasContent, bool Visited, bool Unlocked,
-    int Biome, int IconType,
+    int Biome,
     string? Label = null, string? Color = null,
     bool Arrow = false, bool Nav = false, nint Element = 0,
     IReadOnlyList<string>? ContentIcons = null, bool Visible = false,

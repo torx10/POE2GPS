@@ -143,6 +143,7 @@ public sealed class Poe2Live
         _entCacheKey = 0;
         _league = ""; _leagueFor = -1;
         _areaCode = ""; _areaCodeFor = -1;
+        _areaName = ""; _areaNameFor = -1;
         _plPlayer = 0; _plPlayerFor = 0;
         _cachedPlayerName = null; _cachedPlayerNameFor = 0;
         // Additional per-entity/per-area caches not in the brief's explicit list:
@@ -297,9 +298,7 @@ public sealed class Poe2Live
 
     private string _league = ""; private nint _leagueFor = -1;
 
-    /// <summary>Current league name as the game stores it (ServerData @ AreaInstance+0x598 → std::wstring
-    /// +0x21E0), e.g. "HC Runes of Aldur" / "Standard". The "HC " prefix distinguishes hardcore from
-    /// softcore. Cached per area. (Pulled from Sikaka v0.15.0; read-only.)</summary>
+    /// <summary>Current league name from the current ServerData layout. Cached per area.</summary>
     public string LeagueName(nint areaInstance)
     {
         if (areaInstance == _leagueFor) return _league;
@@ -317,9 +316,32 @@ public sealed class Poe2Live
         if (areaInstance == _areaCodeFor) return _areaCode;
         _areaCodeFor = areaInstance;
         var info = Ptr(areaInstance + Poe2.AreaInstance.AreaInfoPtr);
-        var s = Ptr(info);
+        var s = Ptr(info + Poe2.AreaInfo.Code);
         _areaCode = s == 0 ? "" : _reader.ReadStringUtf16(s, 64);
         return _areaCode;
+    }
+
+    private string _areaName = ""; private nint _areaNameFor = -1;
+
+    /// <summary>Area display name from the current AreaInfo row. Cached per area.</summary>
+    public string AreaName(nint areaInstance)
+    {
+        if (areaInstance == _areaNameFor) return _areaName;
+        _areaNameFor = areaInstance;
+        var info = Ptr(areaInstance + Poe2.AreaInstance.AreaInfoPtr);
+        var s = Ptr(info + Poe2.AreaInfo.Name);
+        _areaName = s == 0 ? "" : _reader.ReadStringUtf16(s, 64);
+        return _areaName;
+    }
+
+    /// <summary>Resolve the entity currently under the game cursor.</summary>
+    public nint MouseOverEntity(nint inGameState)
+    {
+        if (inGameState == 0) return 0;
+        var host = Ptr(inGameState + Poe2.MouseOver.HostFromInGameState);
+        if (host == 0) return 0;
+        var sub = Ptr(host + Poe2.MouseOver.SubFromHost);
+        return sub == 0 ? 0 : Ptr(sub + Poe2.MouseOver.EntityFromSub);
     }
 
     private nint _plPlayer, _plPlayerFor;
@@ -1463,8 +1485,7 @@ public sealed class Poe2Live
         }
         if (!_reader.TryReadStruct<byte>(el + Poe2.UiElement.ScaleIndex, out var idx)) return false;
         _reader.TryReadStruct<float>(el + Poe2.UiElement.LocalScaleMul, out var mul);
-        // Size as ONE atomic 8-byte read (W,H contiguous at 0x288/0x28C) — never split into two reads, or a
-        // mid-update read tears W from one frame and H from another.
+        // Size as one atomic read so a concurrent UI update cannot tear width from height.
         _reader.TryReadStruct<System.Numerics.Vector2>(el + Poe2.UiElement.SizeW, out var sz);
         var (sw, sh) = UiScaleValue(idx, mul, winW, winH);
         if (sw <= 0f || sh <= 0f) return false;
@@ -1788,7 +1809,7 @@ public sealed class Poe2Live
         return true;
     }
 
-    /// <summary>WorldToScreen matrix (16 floats, row-major) from Camera@InGameState+0x368. Null if unavailable.</summary>
+    /// <summary>WorldToScreen matrix (16 floats, row-major) from the current Camera chain.</summary>
     public float[]? CameraMatrix(nint inGameState)
     {
         var cam = Ptr(inGameState + Poe2.InGameState.Camera);
@@ -1937,8 +1958,8 @@ public sealed class Poe2Live
     // ── Inventory read (experimental; default-OFF) ─────────────────────────────────────────────────
     // Ported faithfully from Research.RunInventory / DumpInventoryItems / ReadItemModIds /
     // ReadModValueArray / ReadModName (Research/Program.cs ~line 527-771).
-    // Same chain: AreaInstance+0x598 → ServerData → +0x48 StdVector [0] → ServerDataStructure
-    //             → +0x320 StdVector<InventoryArrayStruct> (stride 0x18).
+    // Same chain: AreaInstance.ServerDataPtr → ServerData → +0x48 StdVector [0] →
+    //             ServerDataStructure → +0x320 StdVector<InventoryArrayStruct> (stride 0x18).
     // Self-validates the two drift-prone hops (PlayerServerData vec, PlayerInventories vec) with
     // brute-scan fallbacks, exactly as the Research probe does.
 
@@ -1990,7 +2011,7 @@ public sealed class Poe2Live
         var result = new List<InventoryItem>();
         try
         {
-            // Step 1 — ServerData @ AreaInstance+0x598.
+            // Step 1 — ServerData at the configured AreaInstance.ServerDataPtr.
             var serverData = Ptr(areaInstance + Poe2.AreaInstance.ServerDataPtr);
             if (serverData == 0) return result;
 
@@ -2385,9 +2406,9 @@ public sealed class Poe2Live
         return true;
     }
 
-    /// <summary>Read one bool entry out of the per-player quest-flags dictionary
-    /// (PlayerServerData+0x230). Walks: AreaInstance → ServerData (+0x598) → PlayerServerData
-    /// StdVector (+0x48) [0] → PlayerServerData → QuestFlags dictionary → probe key.
+    /// <summary>Read one bool entry out of the per-player quest-flags dictionary.
+    /// Walks: AreaInstance → ServerData → PlayerServerData StdVector (+0x48) [0] →
+    /// PlayerServerData → QuestFlags dictionary → probe key.
     /// Dictionary internals are traversed via the shipped StdMap conventions
     /// (<see cref="Poe2.StdMapNode"/>). Returns false when any hop fails or the key is missing.</summary>
     public bool TryReadQuestFlag(nint areaInstance, uint questFlagKey, out bool value)
@@ -2430,18 +2451,6 @@ public sealed class Poe2Live
         }
     }
 
-    /// <summary>Resolve the current hovered entity via the UI-root hover-tracker chain
-    /// (<c>*(UiRoot+0x7D8) → tracker → +0x18</c>). This is the anchor PROBE-CORE uses for
-    /// <c>npc_dialogue_started</c> — when the NpcDialog panel is visible (UI-tree signature walk),
-    /// the hovered entity at dialog-open time identifies the NPC. Returns 0 on any failed hop.</summary>
-    public nint HoveredEntityViaTracker(nint inGameState)
-    {
-        var uiRoot = Ptr(inGameState + Poe2.InGameState.UiRoot);
-        if (uiRoot == 0) return 0;
-        var tracker = Ptr(uiRoot + Poe2.HoverTracker.FromUiRoot);
-        if (tracker == 0) return 0;
-        return Ptr(tracker + Poe2.HoverTracker.HoveredEntityDirect);
-    }
 
     /// <summary>Returns true when the given internal AreaCode names a claimable hideout tile
     /// (matches every known hideout in world_areas.json + atlas_maps.json). Pure function — no

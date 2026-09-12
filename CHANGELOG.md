@@ -3,6 +3,15 @@
 All notable changes to POE2GPS. This project is a strictly read-only, GGG-compliant PoE2 navigation overlay.
 Versions are GitHub release tags (`vX.Y.Z`); the in-app update checker compares against the latest.
 
+## Unreleased — September 2026 compatibility
+
+- Updated the GameState signature to wildcard the build-dependent JNZ displacement and validate the longer instruction sequence.
+- Ported the PoE2 0.5.5 InGameState, AreaInstance, AreaInfo, Entity, ServerData, MapUiElement, and non-uniform UiElement layout changes.
+- Updated Atlas node reads for the current layout: GridPos remains `+0x310`, while State, MapRowIndex, Biome, and Flags are read from their current byte fields; Completion is exposed as an observational candidate only.
+- Replaced legacy scalar/child content inference with a bounded `std::vector<byte>` reader at `+0x368/+0x370/+0x378`. API and Research diagnostics expose raw ContentIds and names from the checked-in numeric snapshot; the live EndgameMapContent/VisualIdentity pointer chain remains unresolved.
+- Confirmed `AtlasNode.DataBiome = 0x2BE`; runtime validated `4997/4997` exact matches across `11` distinct biome values. The Research validator now treats it as a known deep-model mirror and reports direct-vs-deep mismatches; the rejected `+0x2BB` candidate is retained only for comparison output.
+- Fixed local builds reporting stale version metadata; source builds now report `0.42.4` and cannot self-replace through the automatic updater.
+
 ## [0.42.4] — 2026-07-26 "Let The Cap Breathe"
 
 *Audit of the audit. v0.42.3 fixed a real cooldown defect — a restored FPS cap had to wait out another full 10-second window before it could re-throttle — but it fixed it all the way to zero. Because the engage gate measures from the last **engage**, it's already satisfied the instant a restore happens, so a scene with sparse activity re-throttled about half a second after every restore and the cap sat at its floor roughly 95% of the time. That's the "overlay stopped working" symptom v0.42.2 flipped the default for, arriving by a different road. This drop adds a dwell floor: the cap has to stay released a while before staleness can pull it back down. Only reaches you if you opted back into the auto-throttle — it's still off by default.*

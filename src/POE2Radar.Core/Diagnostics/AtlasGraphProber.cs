@@ -9,10 +9,8 @@ public readonly record struct StdVecShape(nint First, nint Last, nint End);
 public readonly record struct GridPosShape(int X, int Y);
 
 /// <summary>
-/// Diagnostic prober for AtlasNode fields. Sweeps candidate offsets for 3 AtlasNode fields
-/// (ConnectionsVec, GridPos, Biome) and returns raw sweep results. Probe-only (no auto-heal,
-/// no HealthState hook). B3b will add auto-heal on top of ConnectionsVec + GridPos;
-/// B3c will add Biome heal on top.
+/// Diagnostic prober for the Atlas connection vector and GridPos fields.
+/// Probe-only; no auto-heal or HealthState hook.
 /// </summary>
 public static class AtlasGraphProber
 {
@@ -94,40 +92,6 @@ public static class AtlasGraphProber
             result.Add(new ProbeSample<GridPosShape>(
                 $"0x{off:X}", $"0x{target:X}",
                 new GridPosShape(x, y), null, passes));
-        }
-        return result.ToArray();
-    }
-
-    /// <summary>
-    /// Sweep Biome (unsigned byte) at candidate offsets [0x300..0x340] step 4.
-    /// Reads 1 byte. Signature-pass if value in [0..12] (13 known biomes).
-    /// </summary>
-    /// <param name="firstNode">AtlasNode element address (0 = not available).</param>
-    /// <param name="r">MemoryReader instance.</param>
-    /// <returns>Array of 17 ProbeSample&lt;int&gt; (empty when firstNode == 0).</returns>
-    public static ProbeSample<int>[] SweepBiome(nint firstNode, MemoryReader r)
-    {
-        if (firstNode == 0) return Array.Empty<ProbeSample<int>>();
-
-        var result = new List<ProbeSample<int>>(17);
-        for (var off = 0x300; off <= 0x340; off += 4)
-        {
-            var target = firstNode + off;
-
-            if (!r.TryReadStruct<byte>(target, out var b))
-            {
-                result.Add(new ProbeSample<int>(
-                    $"0x{off:X}", $"0x{target:X}", 0, "read-fail", false));
-                continue;
-            }
-
-            var value = (int)b;
-
-            // Signature pass: value in [0..12] (13 known biomes)
-            var passes = value >= 0 && value <= 12;
-
-            result.Add(new ProbeSample<int>(
-                $"0x{off:X}", $"0x{target:X}", value, null, passes));
         }
         return result.ToArray();
     }

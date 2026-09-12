@@ -16,10 +16,22 @@ internal static class UpdateChecker
     private const string Repo = "luther-rotmg/POE2GPS";
     public static readonly string ReleasesPage = $"https://github.com/{Repo}/releases";
 
-    /// <summary>This build's version ("0.7.0"), from the assembly version baked in by the csproj.</summary>
+    /// <summary>This build's version, from the assembly version baked in by the overlay project.</summary>
     public static string Current
     {
         get { var v = Assembly.GetExecutingAssembly().GetName().Version; return v == null ? "0.0.0" : $"{v.Major}.{v.Minor}.{v.Build}"; }
+    }
+
+    /// <summary>Local source builds are development builds and must not self-replace from GitHub.</summary>
+    public static readonly bool IsLocalBuild = HasLocalBuildMetadata();
+
+    private static bool HasLocalBuildMetadata()
+    {
+        foreach (var metadata in Assembly.GetExecutingAssembly().GetCustomAttributes<AssemblyMetadataAttribute>())
+            if (metadata.Key == "POE2GPSBuild" &&
+                string.Equals(metadata.Value, "local", StringComparison.OrdinalIgnoreCase))
+                return true;
+        return false;
     }
 
     public sealed record Result(string Current, string? Latest, bool UpdateAvailable, string Url);
