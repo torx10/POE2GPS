@@ -15,18 +15,8 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
-    env:
-      RELEASE_REF_NAME: ${{ github.ref_name }}
-      RELEASE_REF_TYPE: ${{ github.ref_type }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Require a version tag
-        shell: pwsh
-        run: |
-          if (($env:RELEASE_REF_TYPE -ne 'tag') -or ($env:RELEASE_REF_NAME -notmatch '^v\d+\.\d+\.\d+$')) {
-            throw "Release packaging requires a vX.Y.Z tag; got $($env:RELEASE_REF_TYPE)/$($env:RELEASE_REF_NAME)"
-          }
 
       - uses: actions/setup-dotnet@v4
         with:
@@ -47,7 +37,7 @@ jobs:
         run: |
           # Derive the baked-in assembly version straight from the tag (v0.8.1 -> 0.8.1) so the
           # binary can never disagree with the release it ships in, regardless of the csproj value.
-          $ver = $env:RELEASE_REF_NAME.Substring(1)
+          $ver = "${{ github.ref_name }}".TrimStart('v')
           dotnet publish src/POE2Radar.Overlay/POE2Radar.Overlay.csproj `
             -c Release -r win-x64 --self-contained true `
             -p:PublishSingleFile=true `
@@ -66,14 +56,14 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $tag = $env:RELEASE_REF_NAME
+          $tag = "${{ github.ref_name }}"
           Copy-Item README.md, LICENSE, CHANGELOG.md publish/
           Compress-Archive -Path publish/* -DestinationPath "POE2GPS-$tag-win-x64.zip" -Force
 
       - name: Write SHA-256 checksum
         shell: pwsh
         run: |
-          $tag = $env:RELEASE_REF_NAME
+          $tag = "${{ github.ref_name }}"
           $zip = "POE2GPS-$tag-win-x64.zip"
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
           # sha256sum format: "<hash><space><space><filename>"
@@ -84,7 +74,7 @@ jobs:
         run: |
           # Pull the matching "## [X.Y.Z]" section out of CHANGELOG.md so the GitHub Release body
           # carries real patch notes (the auto-generated compare link is still appended below).
-          $ver = $env:RELEASE_REF_NAME.Substring(1)
+          $ver = "${{ github.ref_name }}".TrimStart('v')
           $out = New-Object System.Collections.Generic.List[string]
           $capture = $false
           foreach ($l in (Get-Content CHANGELOG.md)) {
